@@ -191,6 +191,43 @@ impl ShortPretokenCache {
         cap
     }
 
+    /// A copy of this table (same entries) sized by the rule of
+    /// [`Self::with_at_least`] for `self.len` entries and at least
+    /// `min_slots` slots. Used by the worker fork to inherit the
+    /// parent's already-seeded table instead of re-running a BPE merge
+    /// for every vocab entry in every worker: same capacity is one
+    /// memcpy, a larger one re-places each entry by its (recomputed)
+    /// hash, exactly as [`Self::grow`] does — no merge work either way.
+    pub(crate) fn clone_with_min_slots(&self, min_slots: usize) -> Self {
+        let cap = Self::required_capacity(self.len, min_slots);
+        let mut out = Self::with_pow2_capacity(cap);
+        if cap == self.slots.cap {
+            // SAFETY: both allocations hold exactly `cap` entries and
+            // are distinct.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.slots.ptr.as_ptr(),
+                    out.slots.ptr.as_ptr(),
+                    cap,
+                )
+            };
+            out.len = self.len;
+            return out;
+        }
+        for i in 0..self.slots.cap {
+            // SAFETY: i < self.slots.cap.
+            let e = *unsafe { self.slots.get(i) };
+            if e.key == EMPTY_KEY {
+                continue;
+            }
+            let idx = out.first_empty(crate::pretokenize::pretoken_key_hash(e.key));
+            // SAFETY: first_empty returns an in-bounds index.
+            unsafe { *out.slots.get_mut(idx) = e };
+        }
+        out.len = self.len;
+        out
+    }
+
     /// Zero every slot in place (all-zero == all-empty), keeping the
     /// allocation — the generational-wipe path. Like [`Self::insert`]'s
     /// grow, this logically invalidates any outstanding [`ProbeView`].

@@ -273,7 +273,8 @@ impl BPETokenizer {
 struct SentencePieceTokenizer {
     tokenizer: bpe::SentencePieceBPE,
     /// Pretoken cache + scratch for single-document `encode`, persisting
-    /// across calls (parallel paths use per-worker states instead).
+    /// across calls (the parallel batch paths build their per-worker
+    /// states for each call and free them when it returns).
     state: bpe::sentencepiece::EncodeState,
 }
 
@@ -494,7 +495,7 @@ impl SentencePieceTokenizer {
     }
 
     /// Cached unit entries on the single-document `encode` path's state
-    /// (batch encoders are per-call); see `BPETokenizer.cache_entries`.
+    /// (batch workers keep their own caches); see `BPETokenizer.cache_entries`.
     fn cache_entries(&self) -> usize {
         self.state.cache_size()
     }
