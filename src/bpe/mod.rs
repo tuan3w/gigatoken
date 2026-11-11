@@ -1,5 +1,7 @@
 pub(crate) mod pretoken_cache;
 pub mod sentencepiece;
+pub(crate) mod sp_merge;
+pub(crate) mod sp_shared;
 pub mod tiktoken;
 
 /// Ask the kernel for 2 MiB pages over `[ptr, ptr + bytes)` before first

@@ -1,4 +1,5 @@
-use crate::bpe::bpe_merge_symbols_ranked;
+use crate::bpe::sp_merge::{SCRATCH_RETAIN_BYTES, SpMergeScratch, SpPairTable, merge_ranked};
+use crate::bpe::sp_shared::{MAX_SHARED_TOKENS, SharedUnits, key_hash};
 use crate::pretokenize::pack_pretoken_key;
 use crate::token::TokenId;
 use rustc_hash::FxBuildHasher;
@@ -227,6 +228,123 @@ pub struct AddedTokenSpec {
     pub rstrip: bool,
 }
 
+/// Leftmost-longest matcher over the added tokens' contents (pattern index
+/// == `added_tokens` index) with a first-byte prefilter.
+///
+/// A plain Aho-Corasick `find_iter` visits every input byte (a DFA lookup
+/// per byte), which measured as ~half of SentencePiece encode time even for
+/// a three-token vocabulary: the scan costs more than the BPE it guards.
+/// Every match must begin with one of the contents' first bytes, so a SIMD
+/// scan for those bytes (plus a check of the second byte against the
+/// contents' second bytes) finds the only positions where a match can start,
+/// and the automaton runs *anchored* at just those. Anchored leftmost-longest
+/// at the leftmost viable start equals the unanchored leftmost-longest match
+/// (an Aho-Corasick match has no lookbehind), so the match stream is
+/// identical to `find_iter`'s.
+pub(crate) struct AddedMatcher {
+    ac: aho_corasick::AhoCorasick,
+    /// Distinct first bytes of all contents; empty = no prefilter (a
+    /// content is empty, or there are more than [`Self::MAX_FIRST`] first
+    /// bytes, so candidates would be too dense to help).
+    first: Vec<u8>,
+    /// `second[b]`: some content of length >= 2 has `b` as its second byte,
+    /// or some content has length 1 (then any follower may complete a
+    /// match, so every entry is true).
+    second: [bool; 256],
+}
+
+impl AddedMatcher {
+    const MAX_FIRST: usize = 8;
+
+    fn new<'a>(contents: impl Iterator<Item = &'a [u8]> + Clone) -> Self {
+        let ac = aho_corasick::AhoCorasick::builder()
+            .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+            // Anchored searches are issued at prefilter candidates.
+            .start_kind(aho_corasick::StartKind::Both)
+            // A DFA's one lookup per byte beats the contiguous NFA when
+            // the added vocabulary is large (gemma-3 carries 6.4k added
+            // tokens). Prefix sharing (<unusedNNNN>…) keeps the table small.
+            .kind(Some(aho_corasick::AhoCorasickKind::DFA))
+            .build(contents.clone())
+            .expect("added-token automaton");
+        let mut first: Vec<u8> = Vec::new();
+        let mut second = [false; 256];
+        let mut usable = true;
+        for content in contents {
+            match content {
+                [] => usable = false,
+                [b] => {
+                    if !first.contains(b) {
+                        first.push(*b);
+                    }
+                    second = [true; 256];
+                }
+                [b, c, ..] => {
+                    if !first.contains(b) {
+                        first.push(*b);
+                    }
+                    second[*c as usize] = true;
+                }
+            }
+        }
+        if !usable || first.len() > Self::MAX_FIRST {
+            first.clear();
+        }
+        AddedMatcher { ac, first, second }
+    }
+
+    /// The leftmost-longest match starting at or after `from`, as
+    /// `(start, end, pattern)`.
+    fn find_from(&self, hay: &[u8], from: usize) -> Option<(usize, usize, usize)> {
+        use aho_corasick::{Anchored, Input};
+        if self.first.is_empty() {
+            let m = self.ac.find(Input::new(hay).span(from..hay.len()))?;
+            return Some((m.start(), m.end(), m.pattern().as_usize()));
+        }
+        let mut pos = from;
+        loop {
+            let p = pos + self.next_first(&hay[pos..])?;
+            // A content of length 1 is the only way a match ends at the
+            // haystack's last byte without a second byte.
+            let second_ok = hay.get(p + 1).is_none_or(|&c| self.second[c as usize]);
+            if second_ok {
+                let input = Input::new(hay).span(p..hay.len()).anchored(Anchored::Yes);
+                if let Some(m) = self.ac.find(input) {
+                    return Some((m.start(), m.end(), m.pattern().as_usize()));
+                }
+            }
+            pos = p + 1;
+        }
+    }
+
+    /// Offset of the first byte of `hay` that can start a match.
+    #[inline]
+    fn next_first(&self, hay: &[u8]) -> Option<usize> {
+        match self.first.as_slice() {
+            [a] => memchr::memchr(*a, hay),
+            [a, b] => memchr::memchr2(*a, *b, hay),
+            [a, b, c] => memchr::memchr3(*a, *b, *c, hay),
+            set => {
+                use std::simd::prelude::*;
+                let mut i = 0;
+                while i + 16 <= hay.len() {
+                    let v = u8x16::from_slice(&hay[i..]);
+                    let mut m = v.simd_eq(u8x16::splat(set[0]));
+                    for &b in &set[1..] {
+                        m |= v.simd_eq(u8x16::splat(b));
+                    }
+                    let bits = m.to_bitmask();
+                    if bits != 0 {
+                        return Some(i + bits.trailing_zeros() as usize);
+                    }
+                    i += 16;
+                }
+                hay[i..].iter().position(|b| set.contains(b)).map(|j| i + j)
+            }
+        }
+    }
+}
+
 /// A tokenizer that mirrors SentencePiece BPE with `byte_fallback`.
 ///
 /// This struct holds the immutable model data (vocab, merges, added tokens,
@@ -236,6 +354,11 @@ pub struct SentencePieceBPE {
     /// Merges with explicit rank, keyed by [`crate::bpe::ranked_merge_key`]:
     /// `key(a, b) → (merged, rank)`.
     pub(crate) merges: HashMap<u64, (TokenId, u32), FxBuildHasher>,
+    /// Flat copy of `merges` for the encode path, built by
+    /// `finalize_speed_paths`: a second copy of the merge table (16 B
+    /// slots at <= 1/2 load), resident for the model's lifetime and not
+    /// part of any cache budget.
+    pub(crate) pair_table: SpPairTable,
     pub(crate) vocab: Vec<Arc<[u8]>>,
     /// Maps byte sequences → token IDs (for character lookup).
     pub(crate) vocab_inv: HashMap<Arc<[u8]>, TokenId, FxBuildHasher>,
@@ -274,7 +397,7 @@ pub struct SentencePieceBPE {
     /// == `added_tokens` index), like the byte-level path's added matcher —
     /// repeated `str::find` per token costs ~8% of encode on long inputs.
     /// Set by `finalize_speed_paths`.
-    pub(crate) added_matcher: Option<aho_corasick::AhoCorasick>,
+    pub(crate) added_matcher: Option<AddedMatcher>,
     /// Frequent ASCII punctuation to split units *before* (0 = unused slot):
     /// units like "▁word," otherwise explode the distinct-unit space (and
     /// the pretoken cache) with word×punctuation combinations. Set by
@@ -413,6 +536,7 @@ impl SentencePieceBPE {
     /// `raw_prepend`, `space_init`) from the assembled model. Must be called
     /// once by the loader after all other fields are final.
     pub(crate) fn finalize_speed_paths(&mut self) {
+        self.pair_table = SpPairTable::build(&self.merges);
         self.space_init = match self.vocab_inv.get(SP_MARK.as_slice()) {
             Some(&id) => vec![id],
             None => SP_MARK
@@ -430,16 +554,7 @@ impl SentencePieceBPE {
         }
 
         self.added_matcher = (!self.added_tokens.is_empty()).then(|| {
-            aho_corasick::AhoCorasick::builder()
-                .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-                // The scan visits every input byte; a DFA's one lookup per
-                // byte beats the contiguous NFA noticeably when the added
-                // vocabulary is large (gemma-3 carries 6.4k added tokens,
-                // and the scan was ~23% of its encode profile). Prefix
-                // sharing (<unusedNNNN>…) keeps the table small.
-                .kind(Some(aho_corasick::AhoCorasickKind::DFA))
-                .build(self.added_tokens.iter().map(|t| t.content.as_bytes()))
-                .expect("added-token automaton")
+            AddedMatcher::new(self.added_tokens.iter().map(|t| t.content.as_bytes()))
         });
 
         self.cross_pieces = Vec::new();
@@ -771,8 +886,14 @@ impl SentencePieceBPE {
     }
 
     /// SentencePiece analog of [`super::Tokenizer::set_max_cache_bytes`],
-    /// same default: bounds the caches of [`EncodeState`]s created
-    /// afterward, which wipe back to empty (there is no vocab seed here).
+    /// same default and same per-worker meaning: bounds the growing caches
+    /// of every [`EncodeState`] created afterward (a parallel call holds
+    /// one per worker), which wipe back to empty (there is no vocab seed
+    /// here). A state's fixed footprint (`FIXED_STATE_BYTES`, 24 MiB: front
+    /// cache and scratch) counts against the budget, so smaller budgets are
+    /// floored to it. Outside the budget: the shared unit table of a call
+    /// over a large input (32-128 MiB, one per call) and the model's flat
+    /// `pair_table`.
     pub fn set_max_cache_bytes(&mut self, budget: Option<usize>) {
         self.max_cache_bytes = budget;
     }
@@ -861,16 +982,20 @@ fn collapse_space_runs(input: &str, content: &str) -> String {
     out
 }
 
-/// Per-thread mutable encoding context: the pretoken cache plus scratch
-/// buffers, mirroring the byte-level BPE path's memoization. Units repeat
-/// heavily in natural text, so the ranked merge only runs on cache misses.
-/// log2 of the direct-mapped front-cache size (entries). 2^20 keeps the
-/// Zipf-hot working set resident despite eviction churn from tail units.
-const FRONT_BITS: u32 = 20;
+/// log2 of the direct-mapped front-cache size in entries: 2^19 entries of
+/// 32 B is 16 MiB per state. Large enough to keep the Zipf-hot working set
+/// resident despite eviction churn from tail units; 2^20 measured slightly
+/// faster but costs another 16 MiB in every worker.
+const FRONT_BITS: u32 = 19;
 
-/// Fixed footprint of the front cache (keys + vals), subtracted from the
-/// budget before bounding the growing caches.
-const FRONT_BYTES: usize = (1 << FRONT_BITS) * (16 + 8);
+/// Part of a state's cache budget reserved for its fixed footprint: the
+/// 16 MiB front cache plus headroom for the scratch buffers. The growing
+/// caches (short/long maps and arena) get what the budget leaves, so a
+/// budget `B` bounds them at `B - FIXED_STATE_BYTES`; budgets below
+/// `FIXED_STATE_BYTES + 1 MiB` are floored to it.
+const FIXED_STATE_BYTES: usize = 24 << 20;
+const _: () = assert!(FIXED_STATE_BYTES > (1 << FRONT_BITS) * std::mem::size_of::<FrontEntry>());
+
 /// Estimated bytes per map entry, payload + SwissTable slack (`long` adds
 /// its key bytes on top). Length-based, because the wipe keeps allocations.
 const SHORT_ENTRY_BYTES: usize = 48;
@@ -879,22 +1004,126 @@ const LONG_ENTRY_BYTES: usize = 48;
 /// Index of `key` in the front cache: multiplicative hash, top bits.
 #[inline(always)]
 fn front_index(key: u128) -> usize {
-    let folded = (key as u64) ^ ((key >> 64) as u64);
-    let h = folded.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (h >> (64 - FRONT_BITS)) as usize
+    (key_hash(key) >> (64 - FRONT_BITS)) as usize
 }
 
+/// One front-cache entry: the key and the unit's tokens side by side, so a
+/// hit touches one cache line — no second array, no arena. Key 0 = empty.
+///
+/// `p` holds up to four tokens inline (unused trailing lanes `u32::MAX`);
+/// encodings of 0 or >4 tokens are recorded as an arena reference
+/// `[offset, len, 0, ARENA_TAG]` instead (see [`front_payload`]).
+#[derive(Clone, Copy)]
+#[repr(C, align(32))]
+struct FrontEntry {
+    key: u128,
+    p: [u32; 4],
+}
+
+/// Last payload word of an arena-referencing front entry. Never a token ID
+/// (vocabularies are far smaller) and never `u32::MAX` (the unused-lane fill).
+const ARENA_TAG: u32 = u32::MAX - 1;
+
+/// Front-entry payload for the `len` tokens at `arena[off..]`.
+#[inline(always)]
+fn front_payload(arena: &[TokenId], off: u32, len: u32) -> [u32; 4] {
+    if (1..=4).contains(&len) {
+        let mut p = [u32::MAX; 4];
+        for (dst, src) in p.iter_mut().zip(&arena[off as usize..(off + len) as usize]) {
+            *dst = src.0;
+        }
+        p
+    } else {
+        [off, len, 0, ARENA_TAG]
+    }
+}
+
+/// Emit the tokens a front payload stands for.
+#[inline(always)]
+fn emit_payload<S: TokenSink>(sink: &mut S, p: &[u32; 4], arena: &[TokenId]) {
+    if p[3] != ARENA_TAG {
+        let count = 1
+            + (p[1] != u32::MAX) as usize
+            + (p[2] != u32::MAX) as usize
+            + (p[3] != u32::MAX) as usize;
+        // SAFETY: `p` is 16 readable bytes (four TokenIds, a transparent
+        // u32), the first `count` of which are the run.
+        unsafe { sink.emit_short(p.as_ptr() as *const TokenId, count) }
+    } else {
+        emit_run(sink, arena, p[0] as usize, p[1] as usize);
+    }
+}
+
+/// Direct-mapped table of `2^FRONT_BITS` [`FrontEntry`]s on a 64-byte
+/// boundary (two entries per line), zeroed lazily by the allocator.
+struct FrontTable {
+    _storage: Vec<u64>,
+    base: *mut FrontEntry,
+}
+
+// SAFETY: the table owns its storage; the raw pointer only ever aliases it.
+unsafe impl Send for FrontTable {}
+// SAFETY: reads go through `&self` only; mutation needs `&mut self`.
+unsafe impl Sync for FrontTable {}
+
+impl FrontTable {
+    fn new() -> Self {
+        let bytes = std::mem::size_of::<FrontEntry>() << FRONT_BITS;
+        let storage = vec![0u64; (bytes + 64) / 8];
+        let aligned = (storage.as_ptr() as usize + 63) & !63;
+        // The front cache is probed at random for every unit: with 4 KiB
+        // pages that is a dTLB miss + page walk per probe. Ask for 2 MiB
+        // pages before the first touch (calloc'd, still untouched).
+        super::madvise_hugepage(aligned as *mut u8, bytes);
+        FrontTable {
+            _storage: storage,
+            base: aligned as *mut FrontEntry,
+        }
+    }
+
+    /// Entry `idx`, which must be `< 2^FRONT_BITS` (every `front_index`).
+    #[inline(always)]
+    fn at(&self, idx: usize) -> &FrontEntry {
+        debug_assert!(idx < 1 << FRONT_BITS);
+        // SAFETY: in bounds per the contract; the zeroed memory is a valid
+        // FrontEntry and `base` is 64-aligned.
+        unsafe { &*self.base.add(idx) }
+    }
+
+    #[inline(always)]
+    fn set(&mut self, idx: usize, key: u128, p: [u32; 4]) {
+        debug_assert!(idx < 1 << FRONT_BITS);
+        // SAFETY: as in `at`, with exclusive access through `&mut self`.
+        unsafe {
+            *self.base.add(idx) = FrontEntry { key, p };
+        }
+    }
+
+    #[inline(always)]
+    fn ptr(&self, idx: usize) -> *const u8 {
+        self.base.wrapping_add(idx) as *const u8
+    }
+
+    /// Forget every entry (their offsets name a truncated arena).
+    fn clear(&mut self) {
+        // SAFETY: zeroing the whole table; all-zero is the empty entry.
+        unsafe { std::ptr::write_bytes(self.base, 0, 1 << FRONT_BITS) };
+    }
+}
+
+/// Per-thread mutable encoding context: the pretoken cache plus scratch
+/// buffers, mirroring the byte-level BPE path's memoization. Units repeat
+/// heavily in natural text, so the ranked merge only runs on cache misses.
 pub struct EncodeState {
     /// Append-only arena of encoded token IDs; cache entries are
     /// `(offset, len)` slices into it.
     arena: Vec<TokenId>,
-    /// Direct-mapped front cache in front of `short`, split
-    /// structure-of-arrays so a probe touches only the 16 MB key array
-    /// (values load on hit). Zipf-hot units resolve here with one compare
-    /// instead of a SwissTable probe into a couple-hundred-MB map. Key 0 =
-    /// empty (packed keys always carry a nonzero length tag).
-    front_keys: Vec<u128>,
-    front_vals: Vec<(u32, u32)>,
+    /// Direct-mapped front cache in front of `short`: each 32-byte entry
+    /// holds a unit's key and tokens, so a probe touches one cache line.
+    /// Zipf-hot units resolve here with one compare instead of a SwissTable
+    /// probe into a couple-hundred-MB map. Key 0 = empty (packed keys
+    /// always carry a nonzero length tag).
+    front: FrontTable,
     /// Cache for units of ≤ 15 key bytes (the overwhelming majority), keyed
     /// by the same packed `u128` scheme as the byte-level path.
     short: HashMap<u128, (u32, u32), FxBuildHasher>,
@@ -902,6 +1131,8 @@ pub struct EncodeState {
     long: HashMap<Box<[u8]>, (u32, u32), FxBuildHasher>,
     /// Scratch for the merge loop.
     symbols: Vec<TokenId>,
+    /// Long-sequence merge buffers.
+    merge_scratch: SpMergeScratch,
     /// Scratch for composing keys with a virtual leading space.
     key_buf: Vec<u8>,
     /// Byte budget for the growing caches ([`Self::with_budget`]);
@@ -909,9 +1140,15 @@ pub struct EncodeState {
     budget: usize,
     /// Estimated `long` bytes: key bytes + [`LONG_ENTRY_BYTES`] per entry.
     long_bytes_used: usize,
+    /// Cross-thread table of short-unit encodings (set by the worker pool);
+    /// `None` for a standalone state, which keeps everything in `short`.
+    shared: Option<Arc<SharedUnits>>,
     /// Largest single encoding, as wipe-trigger slack: one recurring giant
     /// unit must not force a wipe per occurrence. Kept across wipes.
     max_encoding: usize,
+    /// Bumped by every [`Self::wipe`]: arena offsets resolved before a wipe
+    /// (a batched unit lookup, see [`UnitBatch`]) dangle after it.
+    epoch: u32,
 }
 
 impl EncodeState {
@@ -919,29 +1156,51 @@ impl EncodeState {
         Self::with_budget(Some(super::Tokenizer::DEFAULT_MAX_CACHE_BYTES))
     }
 
-    /// A state whose growing caches (short/long maps + arena; the front
-    /// cache is fixed-size) wipe back to empty when their estimated
-    /// footprint exceeds `max_bytes` minus the front cache, floored at
-    /// 1 MiB so tiny budgets stay functional.
+    /// A state whose growing caches (short/long maps + arena) wipe back to
+    /// empty when their estimated footprint exceeds `max_bytes` minus
+    /// `FIXED_STATE_BYTES` (24 MiB: front cache and scratch), floored at
+    /// 1 MiB so tiny budgets stay functional. `None` = unbounded.
     pub fn with_budget(max_bytes: Option<usize>) -> Self {
         EncodeState {
             arena: Vec::new(),
-            front_keys: vec![0u128; 1 << FRONT_BITS],
-            front_vals: vec![(0u32, 0u32); 1 << FRONT_BITS],
+            front: FrontTable::new(),
             short: HashMap::with_hasher(FxBuildHasher),
             long: HashMap::with_hasher(FxBuildHasher),
             symbols: Vec::new(),
+            merge_scratch: SpMergeScratch::default(),
             key_buf: Vec::new(),
-            budget: max_bytes
-                .map_or(usize::MAX, |t| t.saturating_sub(FRONT_BYTES).max(1 << 20)),
+            budget: max_bytes.map_or(usize::MAX, |t| {
+                t.saturating_sub(FIXED_STATE_BYTES).max(1 << 20)
+            }),
             long_bytes_used: 0,
+            shared: None,
             max_encoding: 0,
+            epoch: 0,
         }
     }
 
     /// Number of cached units (for diagnostics).
     pub fn cache_size(&self) -> usize {
         self.short.len() + self.long.len()
+    }
+
+    /// Number of cache wipes so far.
+    #[cfg(test)]
+    pub(crate) fn wipes(&self) -> u32 {
+        self.epoch
+    }
+
+    /// Drop `symbols` and `key_buf` when one giant unit (100 MB of CJK or
+    /// base64 without a mark) grew them past [`SCRATCH_RETAIN_BYTES`], so
+    /// that capacity does not stay resident for the state's lifetime.
+    #[inline]
+    fn release_oversized_scratch(&mut self) {
+        if self.symbols.capacity() * std::mem::size_of::<TokenId>() > SCRATCH_RETAIN_BYTES {
+            self.symbols = Vec::new();
+        }
+        if self.key_buf.capacity() > SCRATCH_RETAIN_BYTES {
+            self.key_buf = Vec::new();
+        }
     }
 
     #[inline]
@@ -955,8 +1214,9 @@ impl EncodeState {
     #[cold]
     #[inline(never)]
     fn wipe(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
         self.arena.clear();
-        self.front_keys.fill(0);
+        self.front.clear();
         self.short.clear();
         self.long.clear();
         self.long_bytes_used = 0;
@@ -1001,6 +1261,25 @@ fn find_added_token<'s>(
 }
 
 impl<'a> Encoder<'a> {
+    /// An encoder over `model` that resumes `state`, a worker's cache kept
+    /// from earlier chunks of the same call (see `batch::SpCallPool`).
+    pub(crate) fn from_state(model: &'a SentencePieceBPE, state: EncodeState) -> Self {
+        Encoder { model, state }
+    }
+
+    /// Back this encoder's short-unit cache with the call's shared table
+    /// (a state keeps the table it was given).
+    pub(crate) fn ensure_shared(&mut self, shared: impl FnOnce() -> Arc<SharedUnits>) {
+        if self.state.shared.is_none() {
+            self.state.shared = Some(shared());
+        }
+    }
+
+    /// Give the cache state back to the call's pool.
+    pub(crate) fn into_state(self) -> EncodeState {
+        self.state
+    }
+
     /// Encode raw (un-normalized) text with added-token splitting.
     pub fn encode_raw(&mut self, input: &str) -> Vec<TokenId> {
         let mut result = Vec::new();
@@ -1012,6 +1291,27 @@ impl<'a> Encoder<'a> {
     /// Like [`Self::encode_raw`], emitting token runs through `f`.
     pub fn encode_raw_cb<F: FnMut(&[TokenId])>(&mut self, input: &str, f: &mut F) {
         self.model.encode_raw_cb(&mut self.state, input, f);
+    }
+
+    /// [`Self::encode_raw_cb`] for a [`TokenSink`] (fast-path emission).
+    pub(crate) fn encode_raw_sink<S: TokenSink>(&mut self, input: &str, sink: &mut S) {
+        self.model
+            .encode_raw_from(&mut self.state, input, SectionPos::First, sink);
+    }
+
+    /// [`Self::encode_raw_fragment_cb`] for a [`TokenSink`].
+    pub(crate) fn encode_raw_fragment_sink<S: TokenSink>(
+        &mut self,
+        input: &str,
+        first: bool,
+        sink: &mut S,
+    ) {
+        let pos = if first {
+            SectionPos::First
+        } else {
+            SectionPos::Continuation
+        };
+        self.model.encode_raw_from(&mut self.state, input, pos, sink);
     }
 
     /// Like [`Self::encode_raw_cb`] for one fragment of a document split at
@@ -1048,6 +1348,150 @@ fn mark_width(bytes: &[u8], pos: usize, raw: bool) -> Option<usize> {
     }
 }
 
+/// Destination of encoded token runs. Closures `FnMut(&[TokenId])` are
+/// sinks; [`VecSink`] additionally takes short runs branch-free.
+pub trait TokenSink {
+    fn emit(&mut self, tokens: &[TokenId]);
+
+    /// Emit the `count` (<= 4) tokens at `tokens`.
+    ///
+    /// # Safety
+    /// `tokens` must point at 4 readable, initialized `TokenId`s, of which
+    /// the first `count` are the run.
+    #[inline(always)]
+    unsafe fn emit_short(&mut self, tokens: *const TokenId, count: usize) {
+        // SAFETY: the caller guarantees `count` readable tokens.
+        self.emit(unsafe { std::slice::from_raw_parts(tokens, count) });
+    }
+}
+
+impl<F: FnMut(&[TokenId])> TokenSink for F {
+    #[inline(always)]
+    fn emit(&mut self, tokens: &[TokenId]) {
+        self(tokens)
+    }
+}
+
+/// Appends token ids to a `Vec<u32>`.
+pub struct VecSink<'a>(pub &'a mut Vec<u32>);
+
+impl TokenSink for VecSink<'_> {
+    #[inline(always)]
+    fn emit(&mut self, tokens: &[TokenId]) {
+        self.0.extend(tokens.iter().map(|&t| u32::from(t)));
+    }
+
+    /// One fixed-size 16-byte copy plus a length bump: no length-dependent
+    /// branch or loop, which mispredicted on the 1-4 token runs of nearly
+    /// every unit.
+    #[inline(always)]
+    unsafe fn emit_short(&mut self, tokens: *const TokenId, count: usize) {
+        let v = &mut *self.0;
+        if v.capacity() - v.len() < 4 {
+            v.reserve(4);
+        }
+        let len = v.len();
+        // SAFETY: 4 tokens are readable at `tokens` (caller), 4 u32 slots of
+        // spare capacity are writable at `len` (reserved above), and the
+        // regions cannot overlap (a token source is never the output Vec).
+        unsafe {
+            std::ptr::copy_nonoverlapping(tokens as *const u8, v.as_mut_ptr().add(len) as *mut u8, 16);
+            v.set_len(len + count);
+        }
+    }
+}
+
+/// Tokens appended after every arena encoding, so a run of <= 4 tokens can
+/// always be read as one 16-byte block ([`emit_run`]).
+const ARENA_PAD: [TokenId; 3] = [TokenId(0); 3];
+
+/// Emit `arena[start..start + len]`; every arena run is followed by
+/// [`ARENA_PAD`], so short runs may read 4 tokens.
+#[inline(always)]
+fn emit_run<S: TokenSink>(sink: &mut S, arena: &[TokenId], start: usize, len: usize) {
+    debug_assert!(start + len <= arena.len());
+    if (1..=4).contains(&len) {
+        // SAFETY: the run plus its 3-token pad lies in the arena, so with
+        // len >= 1 the 4 tokens from `start` are initialized and in bounds.
+        unsafe { sink.emit_short(arena.as_ptr().add(start), len) }
+    } else {
+        // SAFETY: caller's recorded (start, len) is within the arena.
+        sink.emit(unsafe { arena.get_unchecked(start..start + len) });
+    }
+}
+
+/// Units queued per [`SentencePieceBPE::flush_units`] call: enough
+/// independent cache lookups in flight to cover a DRAM round trip (a
+/// core has ~10-16 line-fill buffers), few enough that the queue stays in
+/// registers/L1.
+const UNIT_BATCH: usize = 32;
+
+/// Pending word units of one `encode_units_impl` walk: byte range, packed
+/// cache key (0 = no short key; unit keys are never 0 because units are
+/// non-empty) and front-cache index.
+struct UnitBatch {
+    start: [usize; UNIT_BATCH],
+    end: [usize; UNIT_BATCH],
+    key: [u128; UNIT_BATCH],
+    idx: [usize; UNIT_BATCH],
+    n: usize,
+}
+
+impl UnitBatch {
+    #[inline(always)]
+    fn new() -> Self {
+        UnitBatch {
+            start: [0; UNIT_BATCH],
+            end: [0; UNIT_BATCH],
+            key: [0; UNIT_BATCH],
+            idx: [0; UNIT_BATCH],
+            n: 0,
+        }
+    }
+
+    /// Queue `bytes[start..end]` and prefetch its front-cache entry.
+    #[inline(always)]
+    fn push(&mut self, state: &EncodeState, bytes: &[u8], start: usize, end: usize) {
+        let n = self.n;
+        // SAFETY: the walker passes start <= end <= bytes.len().
+        let (key, idx) = match pack_pretoken_key(unsafe { bytes.get_unchecked(start..end) }) {
+            Some(key) if key != 0 => {
+                let idx = front_index(key);
+                prefetch_read(state.front.ptr(idx));
+                (key, idx)
+            }
+            _ => (0, 0),
+        };
+        self.start[n] = start;
+        self.end[n] = end;
+        self.key[n] = key;
+        self.idx[n] = idx;
+        self.n = n + 1;
+    }
+}
+
+/// Request the cache line holding `p` into L1; no memory effects, any
+/// address is allowed. No-op on arches without a prefetch hint.
+#[inline(always)]
+pub(crate) fn prefetch_read<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: prefetch has no memory effects; any address is allowed.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: prefetch has no memory effects; any address is allowed.
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{p}]",
+            p = in(reg) p,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = p;
+}
+
 impl SentencePieceBPE {
     /// Encode raw (un-normalized) text into a token buffer. See
     /// [`Self::encode_raw_cb`].
@@ -1076,7 +1520,7 @@ impl SentencePieceBPE {
     /// `Continuation` for a non-first fragment of one (see
     /// [`Self::safe_fragment_ranges`]). Sections after an added-token match
     /// are always `Middle`.
-    fn encode_raw_from<F: FnMut(&[TokenId])>(
+    fn encode_raw_from<F: TokenSink>(
         &self,
         state: &mut EncodeState,
         input: &str,
@@ -1093,21 +1537,26 @@ impl SentencePieceBPE {
         // whitespace adjacent to a match.
         let mut chunk_start = 0usize;
         let mut pos = start;
-        for m in matcher.find_iter(input.as_bytes()) {
-            let spec = &self.added_tokens[m.pattern().as_usize()];
-            if m.start() < chunk_start {
+        let hay = input.as_bytes();
+        let mut scan_from = 0usize;
+        while let Some((m_start, m_end, pattern)) = matcher.find_from(hay, scan_from) {
+            // Like `find_iter`, resume after the match itself — not after
+            // any rstrip-consumed whitespace.
+            scan_from = m_end;
+            let spec = &self.added_tokens[pattern];
+            if m_start < chunk_start {
                 // Swallowed by the previous match's rstrip.
                 continue;
             }
-            let mut chunk = &input[chunk_start..m.start()];
+            let mut chunk = &input[chunk_start..m_start];
             if spec.lstrip {
                 chunk = chunk.trim_end();
             }
             if !chunk.is_empty() {
                 self.encode_section_cb(state, chunk, pos, f);
             }
-            f(&[spec.id]);
-            chunk_start = m.end();
+            f.emit(&[spec.id]);
+            chunk_start = m_end;
             if spec.rstrip {
                 chunk_start += input[chunk_start..].len() - input[chunk_start..].trim_start().len();
             }
@@ -1123,7 +1572,7 @@ impl SentencePieceBPE {
     /// normalizer ops → normalized added-token splitting → Metaspace → BPE.
     /// HF does not re-normalize the parts around a normalized added-token
     /// match.
-    fn encode_section_cb<F: FnMut(&[TokenId])>(
+    fn encode_section_cb<F: TokenSink>(
         &self,
         state: &mut EncodeState,
         text: &str,
@@ -1145,7 +1594,7 @@ impl SentencePieceBPE {
 
         if self.norm_added_tokens.is_empty() {
             let final_text = self.apply_metaspace(normed, first_chunk);
-            self.encode_normalized_cb(state, &final_text, f);
+            self.encode_normalized_sink(state, &final_text, f);
             return;
         }
 
@@ -1161,9 +1610,9 @@ impl SentencePieceBPE {
                     };
                     if !part.is_empty() {
                         let final_text = self.apply_metaspace(Cow::Borrowed(part), first);
-                        self.encode_normalized_cb(state, &final_text, f);
+                        self.encode_normalized_sink(state, &final_text, f);
                     }
-                    f(&[spec.id]);
+                    f.emit(&[spec.id]);
                     let mut rest = &remaining[pos + spec.content.len()..];
                     if spec.rstrip {
                         rest = rest.trim_start();
@@ -1173,7 +1622,7 @@ impl SentencePieceBPE {
                 }
                 None => {
                     let final_text = self.apply_metaspace(Cow::Borrowed(remaining), first);
-                    self.encode_normalized_cb(state, &final_text, f);
+                    self.encode_normalized_sink(state, &final_text, f);
                     break;
                 }
             }
@@ -1183,7 +1632,7 @@ impl SentencePieceBPE {
     /// Raw fast path: split un-normalized text into units directly, mapping
     /// spaces to ▁ on the fly. The dummy-prefix ▁ becomes a virtual leading
     /// space on the first unit, which keys and encodes identically.
-    fn encode_chunk_raw<F: FnMut(&[TokenId])>(
+    fn encode_chunk_raw<F: TokenSink>(
         &self,
         state: &mut EncodeState,
         chunk: &str,
@@ -1217,6 +1666,16 @@ impl SentencePieceBPE {
         input: &str,
         f: &mut F,
     ) {
+        self.encode_normalized_sink(state, input, f);
+    }
+
+    /// [`Self::encode_normalized_cb`] for any [`TokenSink`].
+    fn encode_normalized_sink<F: TokenSink>(
+        &self,
+        state: &mut EncodeState,
+        input: &str,
+        f: &mut F,
+    ) {
         match self.word_split {
             WordSplit::None => self.bpe_chunk(state, input, f),
             _ => self.encode_units(state, input.as_bytes(), false, false, f),
@@ -1228,7 +1687,7 @@ impl SentencePieceBPE {
     /// `raw` selects raw-mode marks (space or ▁) vs normalized-mode marks
     /// (▁ only); `virtual_prefix` logically prepends one space to the first
     /// unit (the raw fast path's dummy prefix).
-    fn encode_units<F: FnMut(&[TokenId])>(
+    fn encode_units<F: TokenSink>(
         &self,
         state: &mut EncodeState,
         bytes: &[u8],
@@ -1236,18 +1695,60 @@ impl SentencePieceBPE {
         raw: bool,
         f: &mut F,
     ) {
-        if raw {
-            self.encode_units_impl::<true, F>(state, bytes, virtual_prefix, f);
-        } else {
-            self.encode_units_impl::<false, F>(state, bytes, virtual_prefix, f);
+        #[cfg(target_arch = "x86_64")]
+        if crate::pretokenize::fast::mask::avx2_scanner_available() {
+            // SAFETY: the AVX2/BMI tier was just detected.
+            unsafe {
+                if raw {
+                    self.encode_units_avx2::<true, F>(state, bytes, virtual_prefix, f);
+                } else {
+                    self.encode_units_avx2::<false, F>(state, bytes, virtual_prefix, f);
+                }
+            }
+            return;
         }
+        if raw {
+            self.encode_units_plain::<true, F>(state, bytes, virtual_prefix, f);
+        } else {
+            self.encode_units_plain::<false, F>(state, bytes, virtual_prefix, f);
+        }
+    }
+
+    /// [`Self::encode_units_impl`] compiled for the baseline target.
+    #[inline(never)]
+    fn encode_units_plain<const RAW: bool, F: TokenSink>(
+        &self,
+        state: &mut EncodeState,
+        bytes: &[u8],
+        virtual_prefix: bool,
+        f: &mut F,
+    ) {
+        self.encode_units_impl::<RAW, false, F>(state, bytes, virtual_prefix, f);
+    }
+
+    /// [`Self::encode_units_impl`] compiled with AVX2 + the BMI bit
+    /// features (tzcnt/blsr/shlx/shrx in the unit walk and key packing).
+    ///
+    /// SAFETY: the caller verified `avx2_scanner_available`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    #[inline(never)]
+    unsafe fn encode_units_avx2<const RAW: bool, F: TokenSink>(
+        &self,
+        state: &mut EncodeState,
+        bytes: &[u8],
+        virtual_prefix: bool,
+        f: &mut F,
+    ) {
+        self.encode_units_impl::<RAW, true, F>(state, bytes, virtual_prefix, f);
     }
 
     /// Walk 32-byte SIMD blocks whose mark-candidate bitmask is drained bit
     /// by bit, closing a unit at each qualifying mark. Candidates are dense
     /// in natural text (~1 per 5 bytes), so the block mask is kept in a
     /// register and the per-candidate hot path is a couple of bit ops.
-    fn encode_units_impl<const RAW: bool, F: FnMut(&[TokenId])>(
+    #[inline(always)]
+    fn encode_units_impl<const RAW: bool, const AVX: bool, F: TokenSink>(
         &self,
         state: &mut EncodeState,
         bytes: &[u8],
@@ -1262,6 +1763,24 @@ impl SentencePieceBPE {
         let mut first_unit = true;
 
         let splats = self.split_bytes.map(u8x16::splat);
+        let mut batch = UnitBatch::new();
+        // Emit `bytes[s..e]` as one unit: the first unit of a virtually
+        // prefixed chunk goes straight through (its key is built in
+        // `key_buf`); every other unit queues for a batched cache lookup.
+        macro_rules! emit_unit {
+            ($s:expr, $e:expr) => {{
+                let (s, e) = ($s, $e);
+                if virtual_prefix && first_unit {
+                    self.encode_unit(state, &bytes[s..e], true, RAW, f);
+                } else {
+                    batch.push(state, bytes, s, e);
+                    if batch.n == UNIT_BATCH {
+                        self.flush_units_for::<AVX, F>(state, bytes, &mut batch, RAW, f);
+                    }
+                }
+                first_unit = false;
+            }};
+        }
 
         let mut block = 0usize;
         while block < bytes.len() {
@@ -1311,14 +1830,7 @@ impl SentencePieceBPE {
                         && mark_pos != unit_start
                         && !self.piece_spans_boundary(bytes, mark_pos, width)
                     {
-                        self.encode_unit(
-                            state,
-                            &bytes[unit_start..mark_pos],
-                            virtual_prefix && first_unit,
-                            RAW,
-                            f,
-                        );
-                        first_unit = false;
+                        emit_unit!(unit_start, mark_pos);
                         unit_start = mark_pos;
                     }
                     last_mark_end = mark_pos + width;
@@ -1332,14 +1844,7 @@ impl SentencePieceBPE {
                     }
                     let safe = &self.split_safe[byte as usize];
                     if safe[(prev >> 6) as usize] & (1 << (prev & 63)) != 0 {
-                        self.encode_unit(
-                            state,
-                            &bytes[unit_start..mark_pos],
-                            virtual_prefix && first_unit,
-                            RAW,
-                            f,
-                        );
-                        first_unit = false;
+                        emit_unit!(unit_start, mark_pos);
                         unit_start = mark_pos;
                     }
                 }
@@ -1349,13 +1854,133 @@ impl SentencePieceBPE {
         // `unit_start` only ever advances to a mark position < len, so a
         // non-empty chunk always has a final unit.
         if unit_start < bytes.len() {
-            self.encode_unit(
-                state,
-                &bytes[unit_start..],
-                virtual_prefix && first_unit,
-                RAW,
-                f,
-            );
+            emit_unit!(unit_start, bytes.len());
+        }
+        if batch.n != 0 {
+            self.flush_units_for::<AVX, F>(state, bytes, &mut batch, RAW, f);
+        }
+    }
+
+    /// Resolve and emit every queued unit, in order. Phase 1 touches only
+    /// the front-cache slots (prefetched when the units were queued) and, for
+    /// hits, requests the cached tokens' arena lines; phase 2 emits. The
+    /// units' cache lookups are then in flight together instead of one
+    /// dependent DRAM round trip per unit — the front table (16 MiB per
+    /// thread) is far beyond L2 and the lookups are the unit loop's
+    /// critical path. A unit that missed the front cache (or whose arena
+    /// offsets a budget wipe invalidated mid-batch) takes the full lookup
+    /// in phase 2, so output order and content are exactly the unbatched
+    /// loop's.
+    #[inline(always)]
+    fn flush_units_for<const AVX: bool, F: TokenSink>(
+        &self,
+        state: &mut EncodeState,
+        bytes: &[u8],
+        batch: &mut UnitBatch,
+        raw: bool,
+        f: &mut F,
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        if AVX {
+            // SAFETY: `AVX` is only instantiated by `encode_units_avx2`,
+            // whose caller verified the AVX2/BMI tier.
+            unsafe { self.flush_units_avx2(state, bytes, batch, raw, f) };
+            return;
+        }
+        self.flush_units(state, bytes, batch, raw, f);
+    }
+
+    /// [`Self::flush_units_body`] for the baseline target.
+    #[inline(never)]
+    fn flush_units<F: TokenSink>(
+        &self,
+        state: &mut EncodeState,
+        bytes: &[u8],
+        batch: &mut UnitBatch,
+        raw: bool,
+        f: &mut F,
+    ) {
+        self.flush_units_body(state, bytes, batch, raw, f);
+    }
+
+    /// [`Self::flush_units_body`] with BMI/AVX2 codegen.
+    ///
+    /// SAFETY: the caller verified `avx2_scanner_available`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    #[inline(never)]
+    unsafe fn flush_units_avx2<F: TokenSink>(
+        &self,
+        state: &mut EncodeState,
+        bytes: &[u8],
+        batch: &mut UnitBatch,
+        raw: bool,
+        f: &mut F,
+    ) {
+        self.flush_units_body(state, bytes, batch, raw, f);
+    }
+
+    #[inline(always)]
+    fn flush_units_body<F: TokenSink>(
+        &self,
+        state: &mut EncodeState,
+        bytes: &[u8],
+        batch: &mut UnitBatch,
+        raw: bool,
+        f: &mut F,
+    ) {
+        let n = batch.n;
+        batch.n = 0;
+        let epoch = state.epoch;
+        let mut hits = 0u32;
+        let mut pay = [[0u32; 4]; UNIT_BATCH];
+        // Branch-free resolution of the front probes: hit/miss is data-random
+        // (~20% misses), so a branch here mispredicts; the loads are
+        // unconditional and the prefetch targets are selected, not branched.
+        for i in 0..n {
+            let key = batch.key[i];
+            let idx = batch.idx[i];
+            // SAFETY: `idx` came from `front_index`, which returns
+            // FRONT_BITS bits (0 for key 0), and the front table has
+            // 2^FRONT_BITS entries.
+            let entry = state.front.at(idx);
+            let (stored, p) = (entry.key, entry.p);
+            let hit = key != 0 && stored == key;
+            pay[i] = p;
+            hits |= (hit as u32) << i;
+            // Only two cases still need a line: a hit that refers to the
+            // arena, and a miss (its shared-table slot). Selected, not
+            // branched; an inline hit re-requests its own resident line.
+            let target = if !hit {
+                match &state.shared {
+                    Some(shared) => shared.slot_ptr(key),
+                    None => state.front.ptr(idx),
+                }
+            } else if p[3] == ARENA_TAG {
+                state.arena.as_ptr().wrapping_add(p[0] as usize) as *const u8
+            } else {
+                state.front.ptr(idx)
+            };
+            prefetch_read(target);
+        }
+        for i in 0..n {
+            if hits >> i & 1 != 0 && state.epoch == epoch {
+                // An arena payload names tokens appended before the probe and
+                // no wipe has run since (the epoch matches); an inline one is
+                // self-contained.
+                emit_payload(f, &pay[i], &state.arena);
+            } else {
+                let key = batch.key[i];
+                self.encode_unit_keyed(
+                    state,
+                    &bytes[batch.start[i]..batch.end[i]],
+                    (key != 0).then_some(key),
+                    batch.idx[i],
+                    false,
+                    raw,
+                    f,
+                );
+            }
         }
     }
 
@@ -1364,7 +1989,7 @@ impl SentencePieceBPE {
     /// byte-equal keys always encode identically), with a `b' '` prefix for
     /// the virtual leading space.
     #[inline]
-    fn encode_unit<F: FnMut(&[TokenId])>(
+    fn encode_unit<F: TokenSink>(
         &self,
         state: &mut EncodeState,
         unit: &[u8],
@@ -1380,19 +2005,54 @@ impl SentencePieceBPE {
         } else {
             pack_pretoken_key(unit)
         };
+        let front_idx = packed.map_or(0, front_index);
+        self.encode_unit_keyed(state, unit, packed, front_idx, virtual_prefix, raw, f);
+    }
+
+    /// [`Self::encode_unit`] with the unit's packed key and front index
+    /// already computed (`front_idx` is meaningful only for `Some` keys).
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn encode_unit_keyed<F: TokenSink>(
+        &self,
+        state: &mut EncodeState,
+        unit: &[u8],
+        packed: Option<u128>,
+        front_idx: usize,
+        virtual_prefix: bool,
+        raw: bool,
+        f: &mut F,
+    ) {
         // Front cache first: one L1/L2 compare resolves Zipf-hot units.
-        let mut front_idx = 0;
         if let Some(key) = packed {
-            front_idx = front_index(key);
-            // SAFETY: the front arrays have 2^FRONT_BITS entries and
+            // SAFETY: the front table has 2^FRONT_BITS entries and
             // `front_index` returns FRONT_BITS bits.
-            if unsafe { *state.front_keys.get_unchecked(front_idx) } == key {
-                let (offset, len) = unsafe { *state.front_vals.get_unchecked(front_idx) };
-                let start = offset as usize;
-                // SAFETY: entries are recorded right after appending `len`
-                // tokens at `offset`; the arena only clears in a budget
-                // wipe, which also zeroes every front key.
-                f(unsafe { state.arena.get_unchecked(start..start + len as usize) });
+            let entry = state.front.at(front_idx);
+            if entry.key == key {
+                let p = entry.p;
+                // Arena references were recorded right after appending
+                // their tokens; the arena only clears in a budget wipe,
+                // which also zeroes every front key.
+                emit_payload(f, &p, &state.arena);
+                return;
+            }
+        }
+        if let Some(key) = packed {
+            let mut toks = [0u32; MAX_SHARED_TOKENS];
+            let n = match &state.shared {
+                Some(shared) => shared.get(key, &mut toks),
+                None => 0,
+            };
+            if n != 0 {
+                if state.over_budget() {
+                    state.wipe();
+                }
+                let offset = state.arena.len();
+                state.arena.extend(toks[..n].iter().map(|&t| TokenId(t)));
+                state.arena.extend_from_slice(&ARENA_PAD);
+                let p = front_payload(&state.arena, offset as u32, n as u32);
+                state.front.set(front_idx, key, p);
+                f.emit(&state.arena[offset..offset + n]);
                 return;
             }
         }
@@ -1403,14 +2063,14 @@ impl SentencePieceBPE {
         };
         if let Some((offset, len)) = cached {
             if let Some(key) = packed {
-                state.front_keys[front_idx] = key;
-                state.front_vals[front_idx] = (offset, len);
+                let p = front_payload(&state.arena, offset, len);
+                state.front.set(front_idx, key, p);
             }
             let start = offset as usize;
             // SAFETY: every cached (offset, len) was recorded right after
             // appending those `len` tokens at `offset`; the arena only
             // clears in a budget wipe, which also clears both maps.
-            f(unsafe { state.arena.get_unchecked(start..start + len as usize) });
+            emit_run(f, &state.arena, start, len as usize);
             return;
         }
 
@@ -1428,17 +2088,25 @@ impl SentencePieceBPE {
         // chunk end, all of which are char boundaries of the original &str.
         let unit_str = unsafe { std::str::from_utf8_unchecked(unit) };
         self.init_symbols(unit_str, raw, &mut state.symbols);
-        bpe_merge_symbols_ranked(&self.merges, &mut state.symbols);
+        merge_ranked(&self.pair_table, &mut state.symbols, &mut state.merge_scratch);
 
         let offset = state.arena.len() as u32;
         let len = state.symbols.len() as u32;
         state.arena.extend_from_slice(&state.symbols);
+        state.arena.extend_from_slice(&ARENA_PAD);
         state.max_encoding = state.max_encoding.max(len as usize);
         match packed {
             Some(key) => {
-                state.short.insert(key, (offset, len));
-                state.front_keys[front_idx] = key;
-                state.front_vals[front_idx] = (offset, len);
+                let published = (1..=MAX_SHARED_TOKENS).contains(&(len as usize))
+                    && state
+                        .shared
+                        .as_ref()
+                        .is_some_and(|shared| shared.insert(key, &state.symbols));
+                if !published {
+                    state.short.insert(key, (offset, len));
+                }
+                let p = front_payload(&state.arena, offset, len);
+                state.front.set(front_idx, key, p);
             }
             None => {
                 let key: Box<[u8]> = if virtual_prefix {
@@ -1450,16 +2118,18 @@ impl SentencePieceBPE {
                 state.long.insert(key, (offset, len));
             }
         }
-        f(&state.symbols);
+        f.emit(&state.symbols);
+        state.release_oversized_scratch();
     }
 
     /// Whole-chunk merge without caching (vocabs with boundary-crossing
     /// pieces).
-    fn bpe_chunk<F: FnMut(&[TokenId])>(&self, state: &mut EncodeState, chunk: &str, f: &mut F) {
+    fn bpe_chunk<F: TokenSink>(&self, state: &mut EncodeState, chunk: &str, f: &mut F) {
         state.symbols.clear();
         self.init_symbols(chunk, false, &mut state.symbols);
-        bpe_merge_symbols_ranked(&self.merges, &mut state.symbols);
-        f(&state.symbols);
+        merge_ranked(&self.pair_table, &mut state.symbols, &mut state.merge_scratch);
+        f.emit(&state.symbols);
+        state.release_oversized_scratch();
     }
 
     /// Character init: each char's vocab piece, or its UTF-8 bytes through
@@ -1495,6 +2165,60 @@ impl SentencePieceBPE {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The prefiltered matcher must yield exactly `find_iter`'s match
+    /// stream (leftmost-longest, non-overlapping), for vocabularies with
+    /// length-1 contents, shared prefixes, a shared first byte, and many
+    /// distinct first bytes (which disables the prefilter), over random
+    /// haystacks dense in the tokens' alphabet.
+    #[test]
+    fn added_matcher_matches_find_iter() {
+        let vocabs: Vec<Vec<&str>> = vec![
+            vec!["<unk>", "<s>", "</s>"],
+            vec!["<s>", "<", "ab"],
+            vec!["\n", "\n\n", "▁▁", "<td>", "<t>"],
+            vec!["a", "ab", "abc", "bcd", "cd", "x"],
+            vec!["ab", "ba", "cd", "dc", "ef", "fe", "gh", "hg", "ij", "ji", "<>"],
+            vec!["<a", "<b", "<c", "<d", "<e", "<f", "<g", "<h", "<i"],
+        ];
+        let alphabet: Vec<&str> = vec![
+            "<", ">", "/", "s", "u", "n", "k", "a", "b", "c", "d", "x", "\n", "▁", " ", "t", "e",
+            "f", "g", "h", "i", "j", "<td>", "<unk>", "</s>", "▁▁",
+        ];
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for vocab in &vocabs {
+            let contents = || vocab.iter().map(|t| t.as_bytes());
+            let reference = aho_corasick::AhoCorasick::builder()
+                .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+                .build(contents())
+                .unwrap();
+            let matcher = AddedMatcher::new(contents());
+            for round in 0..3000 {
+                let len = (next() % if round % 10 == 0 { 400 } else { 24 }) as usize;
+                let mut hay = String::new();
+                for _ in 0..len {
+                    hay.push_str(alphabet[(next() % alphabet.len() as u64) as usize]);
+                }
+                let expected: Vec<(usize, usize, usize)> = reference
+                    .find_iter(hay.as_bytes())
+                    .map(|m| (m.start(), m.end(), m.pattern().as_usize()))
+                    .collect();
+                let mut got = Vec::new();
+                let mut from = 0;
+                while let Some(m) = matcher.find_from(hay.as_bytes(), from) {
+                    from = m.1;
+                    got.push(m);
+                }
+                assert_eq!(got, expected, "vocab {vocab:?} haystack {hay:?}");
+            }
+        }
+    }
 
     #[test]
     fn test_precompiled_fast_scan_matches_grapheme_walk() {
@@ -1593,9 +2317,8 @@ mod tests {
         let mut expected = Vec::new();
         model.encode_raw_with(&mut unbounded, &text, &mut expected);
 
-        // 25 MiB total = ~1 MiB effective past the 24 MiB front cache:
-        // several wipes over ~100k distinct units.
-        let mut budgeted = EncodeState::with_budget(Some(25 << 20));
+        // The fixed footprint plus 1 MiB: several wipes over ~100k distinct units.
+        let mut budgeted = EncodeState::with_budget(Some(FIXED_STATE_BYTES + (1 << 20)));
         let mut actual = Vec::new();
         model.encode_raw_with(&mut budgeted, &text, &mut actual);
         assert_eq!(actual, expected, "budgeted output diverged");

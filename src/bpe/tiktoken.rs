@@ -312,9 +312,10 @@ fn trim_ws_end(bytes: &[u8]) -> usize {
 /// seed-level state is always "vocab seed, then these overwrites" — a pure
 /// function of `(vocab, added_tokens)` — because both
 /// [`Tokenizer::set_added_tokens`] (on the parent) and
-/// [`Tokenizer::fork_sized`] (after a fork's fresh reseed) apply the
-/// overwrites through this one body, so parent and forked workers always
-/// agree on every short pretoken.
+/// [`Tokenizer::fork_sized_with`] (when it rebuilds a fork's cache from
+/// the vocab seed instead of cloning the parent's) apply the overwrites
+/// through this one body, so parent and forked workers always agree on
+/// every short pretoken.
 fn apply_added_token_overwrites(
     added_tokens: &[AddedTokenDef],
     vocab_inv: &HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>,
@@ -334,6 +335,27 @@ fn apply_added_token_overwrites(
         let (val, ext) = Tokenizer::pack_val(&[id], token_arena);
         pretoken_cache.replace(key, h, val, ext);
     }
+}
+
+/// How large a parent's cache may be for [`Tokenizer::fork_sized_with`] to
+/// copy it into the fork; a bigger one is rebuilt from the vocab seed.
+#[derive(Clone, Copy)]
+pub(crate) struct CloneLimits {
+    /// Most short-table entries cloned: 2^19 entries sit at 3/4 load in a
+    /// 2^20-slot table, 32 MiB to copy per fork. A vocab seed is 50k-150k
+    /// entries, so a freshly loaded tokenizer always clones; a parent
+    /// past this has itself encoded a lot, and replicating its warm table
+    /// into every worker costs more memory than a reseed.
+    pub(crate) max_entries: usize,
+    /// Most token-arena entries cloned: 2^21 tokens, 8 MiB per fork.
+    pub(crate) max_arena: usize,
+}
+
+impl CloneLimits {
+    pub(crate) const DEFAULT: Self = Self {
+        max_entries: 1 << 19,
+        max_arena: 1 << 21,
+    };
 }
 
 impl Tokenizer {
@@ -542,7 +564,8 @@ impl Tokenizer {
     /// flag is set (HF's whole-pretoken vocab hit), the merge
     /// decomposition otherwise. One body shared by
     /// [`Self::seeded_pretoken_cache`] and [`Self::set_ignore_merges`] so
-    /// a fork's fresh reseed and the parent's in-place rewrite always
+    /// a fork's reseed (the over-the-clone-limits branch of
+    /// [`Self::fork_sized_with`]) and the parent's in-place rewrite always
     /// agree.
     #[inline]
     fn seed_symbols(
@@ -738,9 +761,12 @@ impl Tokenizer {
         Ok(Self::from_tables(merges, None, vocab, byte_remapping))
     }
 
-    /// Create a new tokenizer sharing the same model data but with a
-    /// freshly seeded cache (no encoded pretokens beyond the vocab seed).
-    /// Useful for per-thread encoding in parallel.
+    /// Create a new tokenizer sharing the same model data, with its own
+    /// cache: a copy of this tokenizer's (the vocab seed, added-token
+    /// overwrites and whatever this tokenizer has encoded itself) while
+    /// that stays within [`CloneLimits::DEFAULT`], else rebuilt from the
+    /// vocab seed. Cache contents never affect encode output. Useful for
+    /// per-thread encoding in parallel.
     pub fn fork(&self) -> Self {
         self.fork_sized(0)
     }
@@ -753,10 +779,17 @@ impl Tokenizer {
     /// pays for the table exactly once. The estimates are capacity hints
     /// only: every structure still grows past them as needed, and the
     /// clamps keep tiny inputs at the default size. The short-table size
-    /// is a floor passed through the vocab seeding, so the seed
-    /// requirement and the workload estimate resolve to one table
+    /// is a floor passed through the table clone or the vocab seeding, so
+    /// the seed requirement and the workload estimate resolve to one table
     /// construction (whichever is larger).
     pub(crate) fn fork_sized(&self, expected_bytes: usize) -> Self {
+        self.fork_sized_with(expected_bytes, CloneLimits::DEFAULT)
+    }
+
+    /// [`Self::fork_sized`] with the clone limits passed explicitly, so
+    /// tests can force the reseed branch without growing a parent past
+    /// the production limits.
+    pub(crate) fn fork_sized_with(&self, expected_bytes: usize, limits: CloneLimits) -> Self {
         // Distinct short pretokens follow Heaps' law: ~1.3M at 1 GB and
         // ~5.5M at 10 GB of OWT-like text gives distinct(n) ≈ 3.45·n^0.62.
         // Size for the Heaps estimate at the table's 3/4 growth load with
@@ -780,29 +813,50 @@ impl Tokenizer {
             arena_cap = arena_cap.min(b.arena_entries);
             long_cap = long_cap.min(b.long_bytes / CacheBudget::LONG_ENTRY_BYTES);
         }
-        let mut token_arena = Vec::with_capacity(arena_cap);
-        let mut pretoken_cache = Self::seeded_pretoken_cache(
-            &self.vocab,
-            self.byte_remapping.as_ref(),
-            self.pair_ranks.as_deref(),
-            &self.merges,
-            self.ranked_merges.as_deref(),
-            self.ignore_merges,
-            &self.vocab_inv,
-            &mut token_arena,
-            cache_slots,
-        );
-        // The vocab seed above holds the plain seed encoding of every short
-        // byte string (merge result, or own ID under `ignore_merges`);
-        // re-apply the added-token `[id]` overwrites so the fork's cache
-        // matches the parent's seed-level state (the shared function is the
-        // sync invariant — see `apply_added_token_overwrites`).
-        apply_added_token_overwrites(
-            &self.added_tokens,
-            &self.vocab_inv,
-            &mut pretoken_cache,
-            &mut token_arena,
-        );
+        // Copy the parent's cache instead of re-seeding it. Every loader
+        // mutator leaves the parent's table at seed level (vocab seed +
+        // added-token overwrites, see `set_ignore_merges` /
+        // `set_added_tokens` / `reseed_cache`), and cache contents never
+        // affect encode output, so the copy is value-identical to a fresh
+        // seed while skipping one BPE merge per short vocab entry on every
+        // worker (tens of ms per worker on a 150k vocab, paid by all
+        // workers at once on a cold run). A parent beyond `limits` has
+        // encoded a lot, and its fork rebuilds the seed-level state
+        // instead of replicating a big warm table.
+        let (pretoken_cache, token_arena) = if self.pretoken_cache.len() <= limits.max_entries
+            && self.token_arena.len() <= limits.max_arena
+        {
+            let mut token_arena =
+                Vec::with_capacity(arena_cap.max(self.token_arena.len()));
+            token_arena.extend_from_slice(&self.token_arena);
+            (self.pretoken_cache.clone_with_min_slots(cache_slots), token_arena)
+        } else {
+            let mut token_arena = Vec::with_capacity(arena_cap);
+            let mut pretoken_cache = Self::seeded_pretoken_cache(
+                &self.vocab,
+                self.byte_remapping.as_ref(),
+                self.pair_ranks.as_deref(),
+                &self.merges,
+                self.ranked_merges.as_deref(),
+                self.ignore_merges,
+                &self.vocab_inv,
+                &mut token_arena,
+                cache_slots,
+            );
+            // The vocab seed above holds the plain seed encoding of every
+            // short byte string (merge result, or own ID under
+            // `ignore_merges`); re-apply the added-token `[id]` overwrites
+            // so the fork's cache matches the parent's seed-level state
+            // (the shared function is the sync invariant — see
+            // `apply_added_token_overwrites`).
+            apply_added_token_overwrites(
+                &self.added_tokens,
+                &self.vocab_inv,
+                &mut pretoken_cache,
+                &mut token_arena,
+            );
+            (pretoken_cache, token_arena)
+        };
         Tokenizer {
             merges: Arc::clone(&self.merges),
             pair_ranks: self.pair_ranks.clone(),
@@ -867,7 +921,7 @@ impl Tokenizer {
     /// [`Self::seed_symbols`]) and reasserts the added-token overwrites,
     /// so the cache stays a pure function of
     /// `(vocab, ignore_merges, added_tokens)` and matches what a fork's
-    /// fresh reseed produces.
+    /// reseed produces.
     ///
     /// Loader-phase mutator: must run before any `WorkerPool` forks
     /// workers from this tokenizer — already-forked workers keep the old
@@ -978,8 +1032,8 @@ impl Tokenizer {
     }
 
     /// Re-establish seed-level state in the existing short table and
-    /// arena: vocab seed, then added-token overwrites — value-identical
-    /// to a fresh fork's construction.
+    /// arena: vocab seed, then added-token overwrites — the state a fork
+    /// rebuilt from scratch starts in (see [`Self::fork_sized_with`]).
     fn reseed_cache(&mut self) {
         Self::seed_into(
             &mut self.pretoken_cache,
@@ -1141,7 +1195,8 @@ impl Tokenizer {
                 // `set_added_tokens` below, which re-derives every added-token
                 // cache overwrite from the updated `vocab_inv` — the same
                 // computation a fork's reseed + re-apply performs (see
-                // [`Self::fork_sized`]), so parent and forked workers agree.
+                // [`Self::fork_sized_with`]), so parent and forked workers
+                // agree.
                 Arc::make_mut(&mut self.vocab_inv).insert(vocab[idx].clone(), id);
             }
             added.push(AddedTokenDef {
@@ -1836,6 +1891,57 @@ mod tests {
         let mut fork = tok.fork();
         assert_eq!(encode(&mut tok, b"hi"), vec![TokenId(256)]);
         assert_eq!(encode(&mut fork, b"hi"), vec![TokenId(256)]);
+    }
+
+    /// A fork of a parent past the clone limits rebuilds its cache from
+    /// the vocab seed plus the added-token overwrites. That branch must
+    /// land in the seed-level state, and encode exactly like the fork that
+    /// copies the warm parent — including an added token whose content
+    /// duplicates a vocab entry (the overwrite the reseed must re-apply).
+    #[test]
+    fn fork_past_clone_limits_reseeds_identically() {
+        let encode = |t: &mut Tokenizer, input: &[u8]| -> Vec<TokenId> {
+            let mut out = Vec::new();
+            t.memoized_encode(crate::pretokenize::pretokenize_as_iter(input), |tokens| {
+                out.extend_from_slice(tokens)
+            });
+            out
+        };
+
+        let mut merges: HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher> =
+            HashMap::with_hasher(rustc_hash::FxBuildHasher {});
+        merges.insert((TokenId(104), TokenId(105)), TokenId(256)); // 'h' 'i' -> "hi"
+        merges.insert((TokenId(116), TokenId(104)), TokenId(257)); // 't' 'h' -> "th"
+        merges.insert((TokenId(257), TokenId(101)), TokenId(258)); // "th" 'e' -> "the"
+        let mut vocab: Vec<Vec<u8>> = (0..=255u32).map(|b| vec![b as u8]).collect();
+        vocab.push(b"hi".to_vec());
+        vocab.push(b"th".to_vec());
+        vocab.push(b"the".to_vec());
+        let mut parent = Tokenizer::new(merges, vocab, None);
+        parent.add_special_token(b"hi".to_vec(), TokenId(1000));
+        let seed_entries = parent.cache_entries();
+
+        // Grow the parent past its seed.
+        let text: &[u8] = b"the thin hi, then there is hither and thither";
+        let expected = encode(&mut parent, text);
+        assert!(
+            parent.cache_entries() > seed_entries,
+            "premise: parent grew"
+        );
+
+        let mut cloned = parent.fork_sized_with(0, CloneLimits::DEFAULT);
+        let mut reseeded = parent.fork_sized_with(
+            0,
+            CloneLimits {
+                max_entries: 0,
+                max_arena: 0,
+            },
+        );
+        assert_eq!(cloned.cache_entries(), parent.cache_entries());
+        assert_eq!(reseeded.cache_entries(), seed_entries);
+        assert_eq!(encode(&mut cloned, text), expected);
+        assert_eq!(encode(&mut reseeded, text), expected);
+        assert_eq!(encode(&mut reseeded, b"hi"), vec![TokenId(1000)]);
     }
 
     /// GPT-2 must take the PairRankTable fast path, with the table agreeing

@@ -2,18 +2,19 @@
 //! encode_files. Documents are grouped into coarse chunks (an oversized
 //! document is split internally — at pretoken-safe boundaries for BPE,
 //! scanner-safe unit boundaries for SentencePiece), encoded by pooled
-//! workers whose pretoken caches persist across calls, and reassembled into
-//! one flat id buffer plus per-document row lengths.
+//! workers, and reassembled into one flat id buffer plus per-document row
+//! lengths. BPE workers persist across calls so their pretoken caches stay
+//! warm; SentencePiece encoder states live for the duration of one call
+//! and are freed when it returns.
 
 use crate::Tokenizer;
 use crate::bpe;
 use crate::bpe::madvise_hugepage;
 use crate::input::DocumentIter;
 use crate::input::file_source::{DocFormat, chunk_ranges};
-use std::ops::Range;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock, TryLockError};
+use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
 
 /// Parallel chunks must hold at least this many bytes: a chunk this size
 /// encodes for tens of milliseconds, so worker acquisition and rayon
@@ -22,10 +23,106 @@ use std::sync::{Mutex, OnceLock, TryLockError};
 /// fan-out costs more than it saves.
 const MIN_CHUNK_BYTES: usize = 1 << 20;
 
-/// Results at least this large get their per-chunk buffers freed on a
-/// background task after the gather returns (see `defer_drop`); smaller
-/// ones drop inline.
+/// Spent id buffers totalling at least this many bytes are freed by a
+/// background task after the gather returns (see [`drop_buffers`]);
+/// smaller totals drop inline.
 const DEFERRED_DROP_MIN_BYTES: usize = 32 << 20;
+
+/// Spent chunk id buffers at least this large are kept for reuse by the
+/// chunks still to start in the same call (see [`IdPool`]); smaller ones
+/// are cheap to allocate and free.
+const ID_POOL_MIN_BYTES: usize = 1 << 20;
+
+/// Upper bound on the bytes of id buffers one call keeps parked in its
+/// [`IdPool`].
+const ID_POOL_MAX_BYTES: usize = 128 << 20;
+
+/// Slack, in ids, on the 2x waste bound of [`id_buffer_fits`], so tiny
+/// requests can still reuse a slightly larger buffer.
+const ID_FIT_SLACK: usize = 4096;
+
+/// Whether a pooled buffer of `capacity` ids can serve a request for `cap`:
+/// big enough, without wasting more than 2x (plus [`ID_FIT_SLACK`]).
+fn id_buffer_fits(capacity: usize, cap: usize) -> bool {
+    capacity >= cap && capacity <= 2 * cap + ID_FIT_SLACK
+}
+
+/// Chunk id buffers recycled within ONE encode call. Every chunk allocates
+/// a ~MB id buffer; once the gather has copied a chunk's ids out, the
+/// buffer comes back here and the chunks still to start reuse its
+/// already-faulted, cache-warm pages instead of paying fresh `mmap`
+/// first-touch faults (and THP zeroing/compaction stalls under
+/// `defrag=madvise`) on the full token output. The pool is a local of the
+/// call, so nothing outlives it: [`run_gathered`] frees what is left once
+/// the gather is done.
+#[derive(Default)]
+struct IdPool {
+    parked: Mutex<ParkedIds>,
+}
+
+/// The buffers an [`IdPool`] holds and their total capacity in bytes.
+#[derive(Default)]
+struct ParkedIds {
+    bufs: Vec<Vec<u32>>,
+    bytes: usize,
+}
+
+impl IdPool {
+    fn lock(&self) -> MutexGuard<'_, ParkedIds> {
+        self.parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// An empty id buffer with capacity for at least `cap` ids: the
+    /// smallest pooled buffer that fits (see [`id_buffer_fits`]), else a
+    /// fresh allocation hinted for huge pages.
+    fn take(&self, cap: usize) -> Vec<u32> {
+        if cap * std::mem::size_of::<u32>() >= ID_POOL_MIN_BYTES {
+            let mut parked = self.lock();
+            let best = parked
+                .bufs
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| id_buffer_fits(v.capacity(), cap))
+                .min_by_key(|(_, v)| v.capacity())
+                .map(|(i, _)| i);
+            if let Some(i) = best {
+                let v = parked.bufs.swap_remove(i);
+                parked.bytes -= v.capacity() * std::mem::size_of::<u32>();
+                return v;
+            }
+        }
+        let mut ids = Vec::with_capacity(cap);
+        madvise_hugepage(ids.as_mut_ptr() as *mut u8, ids.capacity() * 4);
+        ids
+    }
+
+    /// Park a spent id buffer; hands it back when it is too small to be
+    /// worth keeping or the pool is full.
+    fn recycle(&self, mut ids: Vec<u32>) -> Option<Vec<u32>> {
+        let bytes = ids.capacity() * std::mem::size_of::<u32>();
+        if bytes < ID_POOL_MIN_BYTES {
+            return Some(ids);
+        }
+        let mut parked = self.lock();
+        if parked.bytes + bytes > ID_POOL_MAX_BYTES {
+            return Some(ids);
+        }
+        ids.clear();
+        parked.bytes += bytes;
+        parked.bufs.push(ids);
+        None
+    }
+
+    /// Every buffer still parked, for [`drop_buffers`].
+    fn into_buffers(self) -> Vec<Vec<u32>> {
+        self.parked
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .bufs
+    }
+}
 
 /// Target bytes per parallel chunk: ~16 chunks per thread for work-stealing
 /// load balancing, floored at MIN_CHUNK_BYTES so chunks stay coarse.
@@ -48,9 +145,7 @@ pub(crate) fn sp_encode_into(
     lens: &mut Vec<i64>,
 ) {
     let before = ids.len();
-    encoder.encode_raw_cb(text, &mut |tokens| {
-        ids.extend(tokens.iter().map(|&t| u32::from(t)))
-    });
+    encoder.encode_raw_sink(text, &mut bpe::sentencepiece::VecSink(ids));
     lens.push((ids.len() - before) as i64);
 }
 
@@ -65,9 +160,7 @@ fn sp_encode_fragment_into(
     lens: &mut Vec<i64>,
 ) {
     let before = ids.len();
-    encoder.encode_raw_fragment_cb(text, first, &mut |tokens| {
-        ids.extend(tokens.iter().map(|&t| u32::from(t)))
-    });
+    encoder.encode_raw_fragment_sink(text, first, &mut bpe::sentencepiece::VecSink(ids));
     lens.push((ids.len() - before) as i64);
 }
 
@@ -123,19 +216,22 @@ pub(crate) struct ChunkTokens {
     pub(crate) continues: bool,
 }
 
-fn encode_chunk(tokenizer: &mut Tokenizer, chunk: &EncodeChunk) -> ChunkTokens {
-    // Reserve the output once, from a bytes-per-token estimate on the low
-    // side of natural language (~4.4 on OWT/GPT-2). Growing from empty
-    // instead re-copies roughly the final size in doublings — per chunk,
-    // on every chunk of a first pass.
+/// Id capacity requested for a chunk's output: input bytes over the
+/// bytes-per-token estimate documented in `encode_chunk`.
+fn chunk_id_cap(chunk: &EncodeChunk) -> usize {
     let byte_len = match chunk {
         EncodeChunk::Docs(docs) => docs.iter().map(|d| d.len()).sum::<usize>(),
         EncodeChunk::Region { bytes, .. } | EncodeChunk::Fragment { bytes, .. } => bytes.len(),
     };
-    let mut ids = Vec::with_capacity(byte_len / 4 + 16);
-    // Huge pages for the chunk's token output before the encode's stores
-    // fault it in (~2.5 MB/chunk; ordering matters — see Slots::new_zeroed).
-    madvise_hugepage(ids.as_mut_ptr() as *mut u8, ids.capacity() * 4);
+    byte_len / 4 + 16
+}
+
+fn encode_chunk(tokenizer: &mut Tokenizer, chunk: &EncodeChunk, pool: &IdPool) -> ChunkTokens {
+    // Reserve the output once, from a bytes-per-token estimate on the low
+    // side of natural language (~4.4 on OWT/GPT-2). Growing from empty
+    // instead re-copies roughly the final size in doublings — per chunk,
+    // on every chunk of a first pass.
+    let mut ids = pool.take(chunk_id_cap(chunk));
     let mut lens = Vec::new();
     let mut continues = false;
     match chunk {
@@ -286,15 +382,44 @@ fn push_fragment_chunks<'a>(
     }
 }
 
-/// Map items serially when there is at most one (small inputs skip the
-/// thread fan-out), in parallel otherwise.
-pub(crate) fn map_maybe_par<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    use rayon::prelude::*;
-    if items.len() <= 1 {
-        items.iter().map(&f).collect()
-    } else {
-        items.par_iter().map(&f).collect()
+/// Cut every file into document-aligned byte regions for the separator /
+/// JSONL encode paths, with the same descending (LPT) sizes as
+/// `build_doc_chunks`: ~2x-target regions over the first ~80% of the total
+/// bytes (measured across files in order), quarter-target regions over the
+/// last ~20%. Regions are handed out in order, so the small tail bounds how
+/// long the whole pool waits on whichever core — often an E-core — draws
+/// the last region. With `lpt` off every region aims for `target`. Chunking
+/// only moves region boundaries between whole documents, so tokens and
+/// row order are identical either way.
+fn region_chunks<'a>(
+    files: &[&'a [u8]],
+    format: &DocFormat,
+    total: usize,
+    lpt: bool,
+) -> Vec<&'a [u8]> {
+    let target = chunk_target_bytes(total);
+    let head_bytes = total - total / 5;
+    let tail_target = (target / 4).max(MIN_CHUNK_BYTES);
+    let mut regions = Vec::new();
+    let mut base = 0usize;
+    for &bytes in files {
+        let target_at = |start: usize| {
+            if !lpt {
+                target
+            } else if base + start < head_bytes {
+                2 * target
+            } else {
+                tail_target
+            }
+        };
+        regions.extend(
+            chunk_ranges(bytes, format, target_at)
+                .into_iter()
+                .map(|r| &bytes[r]),
+        );
+        base += bytes.len();
     }
+    regions
 }
 
 /// Concatenate per-chunk row lengths into per-document row counts, merging
@@ -315,20 +440,29 @@ fn row_counts(chunks: &[ChunkTokens]) -> Vec<i64> {
     counts
 }
 
-/// Free spent chunk buffers off the caller's critical path. They total as
-/// much memory as the gathered result, and tearing them down is munmap page
-/// teardown under the address-space write lock: inline frees convoy the
-/// gather copy's first-touch faults (read lock) behind each munmap (write
-/// lock), and a serial free after the copy keeps the munmaps inside the
-/// timed window. A detached background task pays the same teardown CPU
+/// The id buffers `chunks` still hold (buffers already committed to the
+/// flat result were recycled and are empty).
+fn spent_buffers(chunks: &mut [ChunkTokens]) -> Vec<Vec<u32>> {
+    chunks
+        .iter_mut()
+        .map(|c| std::mem::take(&mut c.ids))
+        .filter(|v| v.capacity() > 0)
+        .collect()
+}
+
+/// Free spent id buffers off the caller's critical path. They total as
+/// much memory as the gathered result, and tearing them down is munmap
+/// page teardown under the address-space write lock: inline frees convoy
+/// the gather copy's first-touch faults (read lock) behind each munmap
+/// (write lock), and a serial free after the copy keeps the munmaps inside
+/// the timed window. A detached background task pays the same teardown CPU
 /// after the caller has returned, overlapped with whatever runs next, and
-/// occupies at most one pool thread. Small results
-/// (< `DEFERRED_DROP_MIN_BYTES` of tokens) just drop inline: their teardown
-/// is microseconds and not worth holding the memory past return.
-fn defer_drop(chunks: Vec<ChunkTokens>) {
-    let total: usize = chunks.iter().map(|c| c.ids.len()).sum();
-    if total * std::mem::size_of::<u32>() >= DEFERRED_DROP_MIN_BYTES {
-        rayon::spawn(move || drop(chunks));
+/// occupies at most one pool thread. Totals under `DEFERRED_DROP_MIN_BYTES`
+/// drop inline: their teardown is microseconds.
+fn drop_buffers(bufs: Vec<Vec<u32>>) {
+    let bytes = bufs.iter().map(|v| v.capacity()).sum::<usize>() * std::mem::size_of::<u32>();
+    if bytes >= DEFERRED_DROP_MIN_BYTES {
+        rayon::spawn(move || drop(bufs));
     }
 }
 
@@ -354,7 +488,8 @@ fn defer_drop(chunks: Vec<ChunkTokens>) {
 /// and the cursor overflowing the bound, which is impossible for plain
 /// byte input and reachable only when NFC normalization expands bytes
 /// (composition-exclusion pathologies) — `advance` stops committing and
-/// `finish` returns None rather than write past the reservation.
+/// `finish` assembles the result into a fresh exact-size buffer rather than
+/// write past the reservation.
 struct Committer {
     /// Owns the reservation; the Vec struct itself is read or written only
     /// in `finish`. `UnsafeCell` so each `advance` derives the destination
@@ -415,7 +550,7 @@ impl Committer {
     /// the current holder (or a later completion, or `finish`) picks the
     /// chunk up. A completion that lands between the holder's last check
     /// and its unlock is likewise deferred, never lost.
-    fn advance(&self, outs: &[OnceLock<ChunkTokens>]) {
+    fn advance(&self, outs: &[OnceLock<Mutex<ChunkTokens>>], pool: &IdPool) {
         let Ok(mut cur) = self.cursor.try_lock() else {
             return;
         };
@@ -427,9 +562,10 @@ impl Committer {
             if cur.overflowed {
                 return;
             }
-            let Some(chunk) = outs.get(cur.next).and_then(OnceLock::get) else {
+            let Some(slot) = outs.get(cur.next).and_then(OnceLock::get) else {
                 return;
             };
+            let mut chunk = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let len = chunk.ids.len();
             if self.cap - cur.offset < len {
                 cur.overflowed = true;
@@ -443,15 +579,23 @@ impl Committer {
             }
             cur.offset += len;
             cur.next += 1;
+            // The tokens now live in `flat`: hand the chunk buffer back to
+            // the call's pool right away so the chunks still to start reuse
+            // its (cache-warm, already faulted) pages instead of faulting in
+            // fresh memory, and so the live chunk memory stays at the
+            // in-flight set instead of the whole output.
+            let spent = std::mem::take(&mut chunk.ids);
+            drop(chunk);
+            drop(pool.recycle(spent));
         }
     }
 
     /// After all chunks are encoded (and the scope joined): copy the
-    /// uncommitted suffix in parallel, size the buffer to `total` and trim
-    /// the reservation. None means the bound was overrun (see type docs) —
-    /// caller falls back to the classic gather; the prefix copied so far is
-    /// discarded (chunk buffers are still intact).
-    fn finish(self, chunks: &[ChunkTokens], total: usize) -> Option<Vec<u32>> {
+    /// uncommitted suffix in parallel, size the buffer to the total and
+    /// trim the reservation. If the bound was overrun (see type docs) the
+    /// result is assembled into a fresh exact-size buffer instead. Either
+    /// way the spent chunk buffers are returned for the caller to free.
+    fn finish(self, mut chunks: Vec<ChunkTokens>) -> (Vec<u32>, Vec<Vec<u32>>) {
         use rayon::prelude::*;
         /// Raw destination pointer, shareable across the copy tasks. (The
         /// accessor keeps closure capture at the wrapper, not the field.)
@@ -471,8 +615,24 @@ impl Committer {
         let cur = cursor
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Chunks before `cur.next` were recycled after their commit: their
+        // tokens now live only in `flat[..cur.offset]`.
+        let rest_total: usize = chunks[cur.next..].iter().map(|c| c.ids.len()).sum();
+        let total = cur.offset + rest_total;
         if cur.overflowed || total > cap {
-            return None;
+            // Bound overrun (NFC expansion only): assemble into a fresh
+            // exact-size buffer from the committed prefix plus the intact
+            // uncommitted chunks.
+            let mut out: Vec<u32> = Vec::with_capacity(total);
+            // SAFETY: flat[..cur.offset] was fully written by `advance`.
+            out.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(flat.as_ptr(), cur.offset)
+            });
+            for chunk in &chunks[cur.next..] {
+                out.extend_from_slice(&chunk.ids);
+            }
+            drop(flat);
+            return (out, spent_buffers(&mut chunks));
         }
         let rest = &chunks[cur.next..];
         let mut offsets = Vec::with_capacity(rest.len());
@@ -514,7 +674,8 @@ impl Committer {
         // tear down. An allocator that copies instead only costs one
         // memcpy; correctness is unaffected.
         flat.shrink_to_fit();
-        Some(flat)
+        // The suffix is copied out; its buffers are spent.
+        (flat, spent_buffers(&mut chunks))
     }
 }
 
@@ -555,42 +716,60 @@ fn encode_chunks_gathered_with_cap(
     cap_tokens: usize,
 ) -> (Vec<u32>, Vec<i64>) {
     let share = total_bytes / rayon::current_num_threads().max(1);
-    let encode = |c: &EncodeChunk| workers.with_worker(proto, share, |tok| encode_chunk(tok, c));
-    if chunks.len() <= 1 {
+    run_gathered(chunks.len(), cap_tokens, |i, pool| {
+        workers.with_worker(proto, share, |tok| encode_chunk(tok, &chunks[i], pool))
+    })
+}
+
+/// The backend-independent core of the gathered encode: run `encode(i, pool)`
+/// for every chunk index `0..n_chunks` on the rayon pool, handing indices
+/// out in strict order, and gather the results (see
+/// `encode_chunks_gathered` for the handout and `Committer` for the
+/// overlapped copy). `encode` must be callable concurrently, takes its
+/// output buffer from the call's [`IdPool`], and is passed each index
+/// exactly once. Every buffer the call used is freed before it returns
+/// (large totals on a background task, see [`drop_buffers`]).
+fn run_gathered(
+    n_chunks: usize,
+    cap_tokens: usize,
+    encode: impl Fn(usize, &IdPool) -> ChunkTokens + Sync,
+) -> (Vec<u32>, Vec<i64>) {
+    let pool = IdPool::default();
+    if n_chunks <= 1 {
         // Small inputs skip the thread fan-out — and a lone chunk's id
         // buffer IS the flat result, no gather copy at all.
-        return match chunks.first() {
-            Some(chunk) => {
-                let out = encode(chunk);
-                let counts = row_counts(std::slice::from_ref(&out));
-                (out.ids, counts)
-            }
-            None => (Vec::new(), Vec::new()),
+        return if n_chunks == 1 {
+            let out = encode(0, &pool);
+            let counts = row_counts(std::slice::from_ref(&out));
+            (out.ids, counts)
+        } else {
+            (Vec::new(), Vec::new())
         };
     }
     let next = AtomicUsize::new(0);
-    let outs: Vec<OnceLock<ChunkTokens>> = (0..chunks.len()).map(|_| OnceLock::new()).collect();
+    let outs: Vec<OnceLock<Mutex<ChunkTokens>>> =
+        (0..n_chunks).map(|_| OnceLock::new()).collect();
     let committer = Committer::try_new(cap_tokens);
-    let tasks = rayon::current_num_threads().min(chunks.len());
+    let tasks = rayon::current_num_threads().min(n_chunks);
     rayon::scope(|s| {
         for _ in 0..tasks {
             s.spawn(|_| {
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(chunk) = chunks.get(i) else {
+                    if i >= n_chunks {
                         // One last opportunistic drain on the way out: this
                         // worker's final chunk may have been skipped while
                         // another held the commit lock.
                         if let Some(c) = &committer {
-                            c.advance(&outs);
+                            c.advance(&outs, &pool);
                         }
                         break;
-                    };
+                    }
                     // Each index is claimed exactly once, so `set` cannot
                     // already be filled.
-                    let _ = outs[i].set(encode(chunk));
+                    let _ = outs[i].set(Mutex::new(encode(i, &pool)));
                     if let Some(c) = &committer {
-                        c.advance(&outs);
+                        c.advance(&outs, &pool);
                     }
                 }
             });
@@ -598,33 +777,29 @@ fn encode_chunks_gathered_with_cap(
     });
     let outs: Vec<ChunkTokens> = outs
         .into_iter()
-        .map(|slot| slot.into_inner().expect("every claimed chunk was encoded"))
+        .map(|slot| {
+            slot.into_inner()
+                .expect("every claimed chunk was encoded")
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
         .collect();
     let counts = row_counts(&outs);
-    let total: usize = outs.iter().map(|c| c.ids.len()).sum();
-    match committer.and_then(|c| c.finish(&outs, total)) {
-        Some(flat) => {
-            // The copies are done; the spent chunk buffers are dead weight.
-            defer_drop(outs);
-            (flat, counts)
-        }
-        None => (gather_flat(outs), counts),
-    }
+    let (flat, mut spent) = match committer {
+        Some(c) => c.finish(outs),
+        None => gather_flat(outs),
+    };
+    spent.extend(pool.into_buffers());
+    drop_buffers(spent);
+    (flat, counts)
 }
 
-/// Merge per-chunk outputs into one flat id buffer and per-document row
-/// counts. The flat gather copies chunk buffers in parallel into a single
-/// allocation. (The SentencePiece paths gather this way; the BPE batch
-/// path overlaps the copy with the encode — see `Committer` — and falls
-/// back to this only when the up-front reservation is refused or overrun.)
-pub(crate) fn assemble_ragged(chunks: Vec<ChunkTokens>) -> (Vec<u32>, Vec<i64>) {
-    let counts = row_counts(&chunks);
-    (gather_flat(chunks), counts)
-}
-
-/// Copy all chunk id buffers into one freshly allocated flat buffer, in
-/// parallel, freeing the spent chunk buffers off the critical path.
-fn gather_flat(chunks: Vec<ChunkTokens>) -> Vec<u32> {
+/// Copy all chunk id buffers into one freshly allocated exact-size flat
+/// buffer, in parallel, and return it with the spent chunk buffers for the
+/// caller to free. The fallback of the overlapped gather (see
+/// `Committer`), used only when its up-front reservation is refused or
+/// overrun.
+fn gather_flat(mut chunks: Vec<ChunkTokens>) -> (Vec<u32>, Vec<Vec<u32>>) {
     use rayon::prelude::*;
     let total: usize = chunks.iter().map(|c| c.ids.len()).sum();
     let mut flat = vec![0u32; total];
@@ -643,8 +818,7 @@ fn gather_flat(chunks: Vec<ChunkTokens>) -> Vec<u32> {
         .zip(chunks.par_iter())
         .with_max_len(1)
         .for_each(|(dst, chunk)| dst.copy_from_slice(&chunk.ids));
-    defer_drop(chunks);
-    flat
+    (flat, spent_buffers(&mut chunks))
 }
 
 /// Persistent pool of forked tokenizer workers used by encode_batch and
@@ -714,8 +888,12 @@ impl WorkerPool {
                     Err(TryLockError::Poisoned(poisoned)) => {
                         // A worker panicked mid-encode; its cache may be
                         // inconsistent, so rebuild it from the prototype.
+                        // The slot is un-poisoned so the rebuilt worker is
+                        // kept (and stays warm) instead of being rebuilt on
+                        // every later call.
                         let mut guard = poisoned.into_inner();
                         *guard = None;
+                        slot.clear_poison();
                         return f(guard.get_or_insert_with(|| proto.fork_sized(expected_bytes)));
                     }
                     Err(TryLockError::WouldBlock) => {}
@@ -738,12 +916,144 @@ impl WorkerPool {
     ) -> R {
         let mut guard = self.serial.lock().unwrap_or_else(|poisoned| {
             // A worker panicked mid-encode; its cache may be inconsistent,
-            // so rebuild it from the prototype.
+            // so rebuild it from the prototype (un-poisoned, so the rebuilt
+            // worker is kept).
             let mut guard = poisoned.into_inner();
             *guard = None;
+            self.serial.clear_poison();
             guard
         });
         f(guard.get_or_insert_with(|| proto.fork_sized(expected_bytes)))
+    }
+}
+
+/// Sizing of the table of short-unit encodings shared by the workers of one
+/// SentencePiece encode call (see `sp_shared`). Callers use
+/// [`Self::DEFAULT`]; tests pass tiny values to reach the shared-table
+/// paths without a 16 MiB input.
+#[derive(Clone, Copy)]
+struct SharedUnitsParams {
+    /// Inputs below this many bytes keep private caches only: the shared
+    /// table's first-touch page faults would outweigh the merges it saves.
+    min_input: usize,
+    /// Bounds of the table's log2 slot count (64 B per slot).
+    min_log2: u32,
+    max_log2: u32,
+}
+
+/// Input bytes per shared-table slot. A short unit spans several bytes and
+/// most occurrences repeat an earlier one, so distinct units are far fewer
+/// than one per 16 input bytes; the table stays sparse enough for its
+/// two-line probe window to rarely refuse a unit.
+const SHARED_UNITS_BYTES_PER_SLOT: usize = 16;
+
+impl SharedUnitsParams {
+    /// Inputs of 16 MiB and up share a table of 2^19..2^21 slots (32 MiB to
+    /// 128 MiB, mapped lazily as zero pages). The 2^21 cap is reached from
+    /// a 32 MiB input on; at the 16 MiB threshold the size rule already asks
+    /// for 2^20 slots, so the 2^19 floor only matters for a lowered
+    /// threshold. The table is not part of any per-worker cache budget:
+    /// one per call, freed when the call returns.
+    const DEFAULT: Self = Self {
+        min_input: 16 << 20,
+        min_log2: 19,
+        max_log2: 21,
+    };
+
+    /// log2 of the slot count for a call over `size_hint` input bytes.
+    fn log2_slots(&self, size_hint: usize) -> u32 {
+        (size_hint / SHARED_UNITS_BYTES_PER_SLOT)
+            .next_power_of_two()
+            .trailing_zeros()
+            .clamp(self.min_log2, self.max_log2)
+    }
+}
+
+/// The encoder states of ONE SentencePiece encode call: one slot per rayon
+/// thread, filled lazily by the first chunk a thread encodes, so every
+/// later chunk of the call reuses a warm pretoken cache instead of paying a
+/// cold 16 MiB front cache and empty unit maps per chunk. Cache contents
+/// never affect the produced ids (a hit returns what the merge would
+/// compute).
+///
+/// Memory: each state is bounded by the model's per-worker cache budget
+/// (`SentencePieceBPE::max_cache_bytes`), so the call holds up to threads x
+/// budget plus the shared unit table (see [`SharedUnitsParams`]). Nothing
+/// outlives the call: [`Self::release`] frees every state and the table.
+struct SpCallPool<'a> {
+    model: &'a bpe::SentencePieceBPE,
+    slots: Vec<Mutex<Option<bpe::sentencepiece::EncodeState>>>,
+    /// Short-unit encodings shared by every worker (see `sp_shared`);
+    /// `None` when the call's input is below `SharedUnitsParams::min_input`.
+    shared: Option<std::sync::Arc<bpe::sp_shared::SharedUnits>>,
+}
+
+impl<'a> SpCallPool<'a> {
+    /// A pool for a call over `size_hint` input bytes, which sizes the
+    /// shared table.
+    fn new(model: &'a bpe::SentencePieceBPE, size_hint: usize, params: SharedUnitsParams) -> Self {
+        Self {
+            model,
+            slots: (0..rayon::current_num_threads())
+                .map(|_| Mutex::new(None))
+                .collect(),
+            shared: (size_hint >= params.min_input).then(|| {
+                std::sync::Arc::new(bpe::sp_shared::SharedUnits::new(
+                    params.log2_slots(size_hint),
+                ))
+            }),
+        }
+    }
+
+    /// Run `f` with a pooled encoder. The slot's state is moved into the
+    /// encoder and put back afterwards (a panic inside `f` drops it, so the
+    /// slot rebuilds a fresh state next time). Rayon never runs more tasks
+    /// concurrently than it has threads and there is one slot per thread,
+    /// so a free slot always exists; the yield loop only spins when
+    /// non-rayon threads encode at the same time.
+    fn with_encoder<R>(&self, f: impl FnOnce(&mut bpe::sentencepiece::Encoder<'_>) -> R) -> R {
+        loop {
+            for slot in &self.slots {
+                let mut guard = match slot.try_lock() {
+                    Ok(guard) => guard,
+                    Err(TryLockError::Poisoned(poisoned)) => {
+                        // The state was dropped by the panic; the slot just
+                        // starts empty again.
+                        slot.clear_poison();
+                        let mut guard = poisoned.into_inner();
+                        *guard = None;
+                        guard
+                    }
+                    Err(TryLockError::WouldBlock) => continue,
+                };
+                let mut encoder = match guard.take() {
+                    Some(state) => bpe::sentencepiece::Encoder::from_state(self.model, state),
+                    None => self.model.encoder(),
+                };
+                if let Some(shared) = &self.shared {
+                    encoder.ensure_shared(|| std::sync::Arc::clone(shared));
+                }
+                let result = f(&mut encoder);
+                *guard = Some(encoder.into_state());
+                return result;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Free every state and the shared table, in parallel: each state's
+    /// front cache and the table are tens of MiB to unmap.
+    fn release(self) {
+        use rayon::prelude::*;
+        let Self { slots, shared, .. } = self;
+        let states: Vec<bpe::sentencepiece::EncodeState> = slots
+            .into_iter()
+            .filter_map(|slot| {
+                slot.into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+            .collect();
+        rayon::join(|| states.into_par_iter().for_each(drop), || drop(shared));
     }
 }
 
@@ -815,6 +1125,13 @@ enum SpChunk<'a> {
     /// `SentencePieceBPE::safe_fragment_ranges`). Fragments of a document
     /// are consecutive chunks; `first` marks the document's first fragment.
     Fragment { text: &'a str, first: bool },
+    /// A byte region holding many documents, split during encoding
+    /// (JSONL lines or separator-delimited text); contents are trusted
+    /// valid UTF-8.
+    Region {
+        bytes: &'a [u8],
+        format: &'a DocFormat,
+    },
 }
 
 /// Group documents into parallel chunks of roughly `target` bytes. A
@@ -861,63 +1178,107 @@ fn sp_build_chunks<'a>(
     chunks
 }
 
-/// Encode SentencePiece chunks with a per-chunk Encoder and gather them into
-/// one flat id buffer plus per-document row counts (`row_counts` merges a
-/// continuation fragment's first row into the previous document's row).
+/// Id capacity requested for a SentencePiece chunk's output (see
+/// `chunk_id_cap`).
+fn sp_chunk_id_cap(chunk: &SpChunk) -> usize {
+    let byte_len = match chunk {
+        SpChunk::Docs(group) => group.iter().map(|t| t.len()).sum::<usize>(),
+        SpChunk::Fragment { text, .. } => text.len(),
+        SpChunk::Region { bytes, .. } => bytes.len(),
+    };
+    // Llama-family vocabularies emit ~1 token per 3.5-4 bytes of English; a
+    // /3 reservation keeps a chunk's output within its buffer. Untouched
+    // reserved pages cost address space only.
+    byte_len / 3 + 16
+}
+
+/// Encode one SentencePiece chunk with `encoder`, reserving the output once
+/// from a bytes-per-token estimate on the low side of natural language
+/// (pooled, or huge-page hinted before the encode's stores fault it in — as
+/// in `encode_chunk`).
+fn sp_encode_chunk(
+    encoder: &mut bpe::sentencepiece::Encoder<'_>,
+    chunk: &SpChunk,
+    id_pool: &IdPool,
+) -> ChunkTokens {
+    let mut ids: Vec<u32> = id_pool.take(sp_chunk_id_cap(chunk));
+    let mut lens: Vec<i64> = Vec::new();
+    let mut continues = false;
+    match chunk {
+        SpChunk::Docs(group) => {
+            for text in group {
+                sp_encode_into(encoder, text, &mut ids, &mut lens);
+            }
+        }
+        SpChunk::Fragment { text, first } => {
+            sp_encode_fragment_into(encoder, text, *first, &mut ids, &mut lens);
+            continues = !*first;
+        }
+        SpChunk::Region { bytes, format } => {
+            for_each_doc(bytes, format, |doc| {
+                // SAFETY: documents are trusted valid UTF-8 (see
+                // `sp_encode_files_docs`).
+                let text = unsafe { std::str::from_utf8_unchecked(doc) };
+                sp_encode_into(encoder, text, &mut ids, &mut lens);
+            });
+        }
+    }
+    ChunkTokens {
+        ids,
+        lens,
+        continues,
+    }
+}
+
+/// Encode SentencePiece chunks on `pool`'s warm encoder states and gather
+/// them into one flat id buffer plus per-document row counts (`row_counts`
+/// merges a continuation fragment's first row into the previous document's
+/// row), overlapping the gather copy with the encode exactly as the BPE
+/// path does (see `run_gathered`).
+fn sp_encode_chunks_in(
+    pool: &SpCallPool,
+    chunks: &[SpChunk],
+    total_bytes: usize,
+) -> (Vec<u32>, Vec<i64>) {
+    // A token consumes >= 1 input byte, so total_bytes tokens is the
+    // reservation bound (normalization expansion is caught by the
+    // committer's overflow escape).
+    run_gathered(chunks.len(), total_bytes, |i, id_pool| {
+        pool.with_encoder(|encoder| sp_encode_chunk(encoder, &chunks[i], id_pool))
+    })
+}
+
+/// [`sp_encode_chunks_in`] on a pool made for this one call: the encoder
+/// states and the shared unit table are freed before it returns.
 fn sp_encode_chunks(
     tokenizer: &bpe::SentencePieceBPE,
     chunks: &[SpChunk],
+    total_bytes: usize,
+    shared: SharedUnitsParams,
 ) -> (Vec<u32>, Vec<i64>) {
-    let outs = map_maybe_par(chunks, |chunk| {
-        // Reserve the output once from a bytes-per-token estimate on the
-        // low side of natural language, with huge pages before the encode's
-        // stores fault it in — as in `encode_chunk`.
-        let byte_len = match chunk {
-            SpChunk::Docs(group) => group.iter().map(|t| t.len()).sum::<usize>(),
-            SpChunk::Fragment { text, .. } => text.len(),
-        };
-        let mut ids: Vec<u32> = Vec::with_capacity(byte_len / 4 + 16);
-        madvise_hugepage(ids.as_mut_ptr() as *mut u8, ids.capacity() * 4);
-        let mut encoder = tokenizer.encoder();
-        let mut lens: Vec<i64> = Vec::new();
-        let mut continues = false;
-        match chunk {
-            SpChunk::Docs(group) => {
-                for text in group {
-                    sp_encode_into(&mut encoder, text, &mut ids, &mut lens);
-                }
-            }
-            SpChunk::Fragment { text, first } => {
-                sp_encode_fragment_into(&mut encoder, text, *first, &mut ids, &mut lens);
-                continues = !*first;
-            }
-        }
-        ChunkTokens {
-            ids,
-            lens,
-            continues,
-        }
-    });
-    assemble_ragged(outs)
+    let pool = SpCallPool::new(tokenizer, total_bytes, shared);
+    let result = sp_encode_chunks_in(&pool, chunks, total_bytes);
+    pool.release();
+    result
 }
 
 /// SentencePiece analog of `encode_docs_ragged`: group whole documents into
 /// parallel chunks — splitting an oversized document into scanner-safe
-/// fragments (see `sp_build_chunks`) — and encode each chunk with its own
-/// Encoder.
+/// fragments (see `sp_build_chunks`) — and encode the chunks with the
+/// call's pooled encoder states.
 pub fn sp_encode_docs_ragged(
     tokenizer: &bpe::SentencePieceBPE,
     texts: &[&str],
 ) -> (Vec<u32>, Vec<i64>) {
     let total: usize = texts.iter().map(|t| t.len()).sum();
     let chunks = sp_build_chunks(tokenizer, texts, chunk_target_bytes(total));
-    sp_encode_chunks(tokenizer, &chunks)
+    sp_encode_chunks(tokenizer, &chunks, total, SharedUnitsParams::DEFAULT)
 }
 
 /// Sequential `sp_encode_docs_ragged`: one Encoder (so one pretoken cache)
 /// over all documents, on the calling thread, never touching rayon. Token-
 /// and order-identical to the parallel path, which encodes the same
-/// documents in the same order with per-chunk Encoders.
+/// documents in the same order with per-worker encoder states.
 pub(crate) fn sp_encode_docs_ragged_serial(
     tokenizer: &bpe::SentencePieceBPE,
     texts: &[&str],
@@ -945,17 +1306,9 @@ pub(crate) fn encode_files_docs(
         return encode_docs_ragged(workers, proto, files);
     }
     let total: usize = files.iter().map(|f| f.len()).sum();
-    let target = chunk_target_bytes(total);
-    let chunks: Vec<EncodeChunk> = files
-        .iter()
-        .flat_map(|&bytes| {
-            chunk_ranges(bytes, format, target)
-                .into_iter()
-                .map(move |r| EncodeChunk::Region {
-                    bytes: &bytes[r],
-                    format,
-                })
-        })
+    let chunks: Vec<EncodeChunk> = region_chunks(files, format, total, lpt_from_env())
+        .into_iter()
+        .map(|bytes| EncodeChunk::Region { bytes, format })
         .collect();
     encode_chunks_gathered(workers, proto, &chunks, total)
 }
@@ -988,7 +1341,7 @@ pub(crate) fn encode_files_docs_serial(
 /// file is one document (small files are grouped, huge ones split at
 /// scanner-safe boundaries); otherwise each file is cut into byte regions at
 /// document boundaries and each region's documents are encoded with a
-/// per-chunk Encoder. Documents are assumed to be valid UTF-8.
+/// pooled Encoder. Documents are assumed to be valid UTF-8.
 pub(crate) fn sp_encode_files_docs(
     tokenizer: &bpe::SentencePieceBPE,
     files: &[&[u8]],
@@ -1000,38 +1353,18 @@ pub(crate) fn sp_encode_files_docs(
         let texts: Vec<&str> = files
             .iter()
             // SAFETY: file contents are trusted valid UTF-8 (encode_files'
-            // documented contract, like the unchecked conversion below).
+            // documented contract, like the unchecked conversion in
+            // `sp_encode_chunk`).
             .map(|&bytes| unsafe { std::str::from_utf8_unchecked(bytes) })
             .collect();
         return sp_encode_docs_ragged(tokenizer, &texts);
     }
     let total: usize = files.iter().map(|f| f.len()).sum();
-    let target = chunk_target_bytes(total);
-    let chunks: Vec<(usize, Range<usize>)> = files
-        .iter()
-        .enumerate()
-        .flat_map(|(i, &bytes)| {
-            chunk_ranges(bytes, format, target)
-                .into_iter()
-                .map(move |r| (i, r))
-        })
+    let chunks: Vec<SpChunk> = region_chunks(files, format, total, lpt_from_env())
+        .into_iter()
+        .map(|bytes| SpChunk::Region { bytes, format })
         .collect();
-    let outs = map_maybe_par(&chunks, |(file, range)| {
-        let bytes = &files[*file][range.clone()];
-        let mut encoder = tokenizer.encoder();
-        let mut ids: Vec<u32> = Vec::new();
-        let mut lens: Vec<i64> = Vec::new();
-        for_each_doc(bytes, format, |doc| {
-            let text = unsafe { std::str::from_utf8_unchecked(doc) };
-            sp_encode_into(&mut encoder, text, &mut ids, &mut lens);
-        });
-        ChunkTokens {
-            ids,
-            lens,
-            continues: false,
-        }
-    });
-    assemble_ragged(outs)
+    sp_encode_chunks(tokenizer, &chunks, total, SharedUnitsParams::DEFAULT)
 }
 
 /// Sequential `sp_encode_files_docs`: one Encoder over every file's
@@ -1211,7 +1544,12 @@ mod tests {
                 fragments > 50,
                 "{repo}: expected many fragments, got {fragments}"
             );
-            let (ids, lens) = sp_encode_chunks(&tok, &chunks);
+            let (ids, lens) = sp_encode_chunks(
+                &tok,
+                &chunks,
+                texts.iter().map(|t| t.len()).sum(),
+                SharedUnitsParams::DEFAULT,
+            );
             assert_eq!(lens, lens_ref, "{repo}: lens mismatch (small target)");
             assert_ids_match(&format!("{repo} (small target)"), &ids, &ids_ref);
         }
@@ -1337,10 +1675,140 @@ mod tests {
                 "expected a cut attempt every few bytes, got {} chunks",
                 chunks.len()
             );
-            let (ids, lens) = sp_encode_chunks(&tok, &chunks);
+            let (ids, lens) = sp_encode_chunks(
+                &tok,
+                &chunks,
+                texts.iter().map(|t| t.len()).sum(),
+                SharedUnitsParams::DEFAULT,
+            );
             assert_eq!(lens, lens_ref, "{prepend:?}: lens mismatch");
             assert_ids_match(&format!("{prepend:?}"), &ids, &ids_ref);
         }
+    }
+
+    /// The shared unit table path — normally reached only by inputs of
+    /// 16 MiB and up — forced onto a 2-16 slot table, with a tiny cache
+    /// budget (every state wipes repeatedly) and several encodes on one
+    /// pool whose states and table stay warm in between, must be token-
+    /// and order-identical to the serial one-encoder encode. The words make
+    /// units of 2-4 tokens (inline front payload), 6-11 (shared-table
+    /// entries past the first four tokens) and 15 (never shared).
+    #[test]
+    fn sp_shared_table_pool_matches_serial() {
+        use crate::load_tokenizer::hf::{HfTokenizer, load_hf_slice};
+
+        // ▁, 16 letters and four merged pairs on top of the byte-fallback
+        // tokens; Llama-2-style normalizer (raw fast path).
+        let mut vocab_entries: Vec<String> = (0u16..=255)
+            .map(|b| format!("\"<0x{b:02X}>\": {b}"))
+            .collect();
+        let mut next_id = 256u32;
+        vocab_entries.push(format!("\"\u{2581}\": {next_id}"));
+        let pieces = "abcdefghijklmnop"
+            .chars()
+            .map(String::from)
+            .chain(["ab", "cd", "ef", "gh"].map(String::from));
+        for piece in pieces {
+            next_id += 1;
+            vocab_entries.push(format!("\"{piece}\": {next_id}"));
+        }
+        let json = format!(
+            "{{\"added_tokens\": [], \
+              \"normalizer\": {{\"type\": \"Sequence\", \"normalizers\": [\
+                {{\"type\": \"Prepend\", \"prepend\": \"\u{2581}\"}}, \
+                {{\"type\": \"Replace\", \"pattern\": {{\"String\": \" \"}}, \
+                  \"content\": \"\u{2581}\"}}]}}, \
+              \"pre_tokenizer\": null, \
+              \"model\": {{\"type\": \"BPE\", \"byte_fallback\": true, \
+                \"vocab\": {{{}}}, \
+                \"merges\": [[\"a\", \"b\"], [\"c\", \"d\"], [\"e\", \"f\"], [\"g\", \"h\"]]}}}}",
+            vocab_entries.join(", ")
+        );
+        let load = || match load_hf_slice(json.as_bytes()).unwrap() {
+            HfTokenizer::SentencePiece(tok) => tok,
+            _ => panic!("synthetic model should load as SentencePiece"),
+        };
+        let reference = load();
+        let mut tok = load();
+        // Floored to the smallest budget: 1 MiB for the growing caches.
+        tok.set_max_cache_bytes(Some(0));
+
+        let mut state = 0x853C_49E6_748F_EA9Bu64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        let mut words = |n: usize| -> String {
+            let mut text = String::new();
+            for i in 0..n {
+                if i > 0 {
+                    text.push(' ');
+                }
+                let len = match next() % 3 {
+                    0 => 1 + next() % 3,
+                    1 => 5 + next() % 6,
+                    _ => 14,
+                };
+                for _ in 0..len {
+                    text.push((b'a' + (next() % 16) as u8) as char);
+                }
+            }
+            text
+        };
+        let owned_a = [
+            words(12_000),
+            words(1),
+            String::new(),
+            words(24_000),
+            words(200),
+        ];
+        let owned_b = [words(18_000), words(300), words(15_000)];
+        let texts_a: Vec<&str> = owned_a.iter().map(String::as_str).collect();
+        let texts_b: Vec<&str> = owned_b.iter().map(String::as_str).collect();
+        let inputs = [&texts_a, &texts_b];
+        let refs = inputs.map(|texts| sp_encode_docs_ragged_serial(&reference, texts));
+
+        // Two worker threads, so each state sees enough distinct units to
+        // wipe whatever the machine's core count.
+        let rayon_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        rayon_pool.install(|| {
+            for log2 in [1u32, 2, 4] {
+                let params = SharedUnitsParams {
+                    min_input: 0,
+                    min_log2: log2,
+                    max_log2: log2,
+                };
+                let pool = SpCallPool::new(&tok, 0, params);
+                for (round, which) in [0usize, 1, 0].into_iter().enumerate() {
+                    let texts = inputs[which];
+                    let total: usize = texts.iter().map(|t| t.len()).sum();
+                    let chunks = sp_build_chunks(&tok, texts, 16 << 10);
+                    assert!(
+                        chunks.len() >= 8,
+                        "expected many chunks, got {}",
+                        chunks.len()
+                    );
+                    let (ids, lens) = sp_encode_chunks_in(&pool, &chunks, total);
+                    let (ids_ref, lens_ref) = &refs[which];
+                    let tag = format!("log2={log2} round={round}");
+                    assert_eq!(&lens, lens_ref, "{tag}: lens mismatch");
+                    assert_ids_match(&tag, &ids, ids_ref);
+                }
+                assert!(pool.shared.is_some(), "log2={log2}: no shared table");
+                let wipes: u32 = pool
+                    .slots
+                    .iter()
+                    .map(|slot| slot.lock().unwrap().as_ref().map_or(0, |s| s.wipes()))
+                    .sum();
+                assert!(wipes > 0, "log2={log2}: the tiny budget never wiped");
+                pool.release();
+            }
+        });
     }
 
     /// SentencePiece parallel-vs-serial on REAL text: ~290 MB of OWT

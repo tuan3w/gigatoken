@@ -148,15 +148,17 @@ pub fn load_file(path: &Path) -> Result<LoadedFile, std::io::Error> {
     })
 }
 
-/// Cut `bytes` into ranges of roughly `target` bytes, each ending on a
-/// document boundary so no document spans two chunks. A single range is
-/// returned when the input is smaller than `target` or has no boundaries
-/// (plain text without a separator is one document, which cannot be split
-/// without changing tokenization).
+/// Cut `bytes` into ranges of roughly `target_at(start)` bytes (the target
+/// for the chunk beginning at offset `start`, so callers can taper chunk
+/// sizes along the buffer), each ending on a document boundary so no
+/// document spans two chunks. A single range is returned when the input is
+/// smaller than the target or has no boundaries (plain text without a
+/// separator is one document, which cannot be split without changing
+/// tokenization).
 pub fn chunk_ranges(
     bytes: &[u8],
     format: &DocFormat,
-    target: usize,
+    target_at: impl Fn(usize) -> usize,
 ) -> Vec<std::ops::Range<usize>> {
     let len = bytes.len();
     // `next_boundary(probe)` finds the first document boundary at or after
@@ -165,7 +167,7 @@ pub fn chunk_ranges(
         let mut out = Vec::new();
         let mut start = 0;
         while start < len {
-            let probe = start + target;
+            let probe = start + target_at(start);
             match (probe < len).then(|| next_boundary(probe)).flatten() {
                 Some((end, next_start)) => {
                     out.push(start..end);

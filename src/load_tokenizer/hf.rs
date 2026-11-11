@@ -397,6 +397,7 @@ fn build_sentencepiece(tj: &TokenizerJson) -> Result<SentencePieceBPE> {
 
     let mut model = SentencePieceBPE {
         merges,
+        pair_table: crate::bpe::sp_merge::SpPairTable::empty(),
         vocab,
         vocab_inv,
         byte_fallback_ids,

@@ -1,6 +1,11 @@
 //! The process-global cache-budget knob, read once per tokenizer
 //! construction. Semantics in the .pyi stubs, mechanism in
 //! `Tokenizer::set_max_cache_bytes`.
+//!
+//! The budget is per encode worker. SentencePiece models additionally hold,
+//! outside it, a flat merge table per model and — for the duration of one
+//! parallel encode call over a large input — a shared unit table of
+//! 32-128 MiB (see `SentencePieceBPE::set_max_cache_bytes`).
 
 use crate::bpe::{SentencePieceBPE, Tokenizer};
 use pyo3::prelude::*;
